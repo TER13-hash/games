@@ -26,9 +26,9 @@
         "$className": "StarterPlayerScripts",
         "GameClient": { "$path": "src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau" },
         "Effects": { "$path": "src/StarterPlayer/StarterPlayerScripts/Effects.luau" },
-        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.client.luau" },
-        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.client.luau" },
-        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.client.luau" }
+        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau" },
+        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau" },
+        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.luau" }
       }
     },
     "Lighting": {

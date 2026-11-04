@@ -11,10 +11,10 @@ local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
-local Effects = require(script:WaitForChild("Effects"))
-local TitleScreen = require(script:WaitForChild("TitleScreen.client.luau"))
-local PauseMenu = require(script:WaitForChild("PauseMenu.client.luau"))
-local Settings = require(script:WaitForChild("Settings.client.luau"))
+local Effects = require(script.Parent:WaitForChild("Effects"))
+local TitleScreen = require(script.Parent:WaitForChild("TitleScreen"))
+local PauseMenu = require(script.Parent:WaitForChild("PauseMenu"))
+local Settings = require(script.Parent:WaitForChild("Settings"))
 
 -- device detection
 local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
