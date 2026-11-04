@@ -1,0 +1,191 @@
+/*
+	Cute Framework
+	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
+
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
+*/
+
+#ifndef CF_APP_INTERNAL_H
+#define CF_APP_INTERNAL_H
+
+#include <cute_app.h>
+#include <cute_audio.h>
+#include <cute_array.h>
+#include <cute_math.h>
+#include <cute_doubly_list.h>
+#include <cute_custom_sprite.h>
+#include <cute_graphics.h>
+#include <cute_input.h>
+#include <cute_string.h>
+#include <cute_image.h>
+#include <cute_file_system.h>
+
+#include <internal/cute_draw_internal.h>
+#include <internal/cute_font_internal.h>
+#include <internal/cute_graphics_internal.h>
+
+#include <SDL3/SDL.h>
+
+struct SDL_Window;
+struct cs_context_t;
+
+CF_API extern struct CF_App* app;
+
+// Recreates the default offscreen canvas at logical_size * pixel_scale. Called on init and on
+// every canvas recreation event (window resize, display density change, cf_app_set_size,
+// cf_app_set_msaa) -- this is what makes cf_app_set_canvas_size a one-shot override.
+void cf_app_recreate_default_canvas_if_needed();
+
+// Maps an SDL_PowerState to the corresponding CF_PowerState. Header-inline (rather than
+// CF_API) so it stays testable from test/test_app.cpp without crossing the shared-library
+// export boundary.
+CF_INLINE CF_PowerState cf_power_state_from_sdl(SDL_PowerState state)
+{
+	CF_PowerState result = CF_POWER_STATE_UNKNOWN;
+	switch (state) {
+	case SDL_POWERSTATE_ERROR: result = CF_POWER_STATE_ERROR; break;
+	case SDL_POWERSTATE_UNKNOWN: result = CF_POWER_STATE_UNKNOWN; break;
+	case SDL_POWERSTATE_ON_BATTERY: result = CF_POWER_STATE_ON_BATTERY; break;
+	case SDL_POWERSTATE_NO_BATTERY: result = CF_POWER_STATE_NO_BATTERY; break;
+	case SDL_POWERSTATE_CHARGING: result = CF_POWER_STATE_CHARGING; break;
+	case SDL_POWERSTATE_CHARGED: result = CF_POWER_STATE_CHARGED; break;
+	}
+	return result;
+}
+
+struct CF_MouseState
+{
+	int left_button = 0;
+	int right_button = 0;
+	int middle_button = 0;
+	int x1_button = 0;
+	int x2_button = 0;
+	float wheel_motion = 0;
+	float x = 0;
+	float y = 0;
+	float xrel = 0;
+	float yrel = 0;
+	int click_type = 0;
+};
+
+struct CF_WindowState
+{
+	bool mouse_inside_window = false;
+	bool has_keyboard_focus = false;
+	bool minimized = false;
+	bool maximized = false;
+	bool restored = false;
+	bool resized = false;
+	bool moved = false;
+};
+
+struct CF_ShaderFileInfo
+{
+	uint64_t last_modified_time;  // The only piece of stat the watcher compares.
+	const char* path;
+};
+
+struct CF_PendingEvent
+{
+	SDL_Event event;
+	// Offset of the event's text in `CF_App::pending_event_text`, or -1. SDL frees event strings
+	// on the next event pump, which can run before a queued event is handled.
+	int text_offset;
+};
+
+struct CF_App
+{
+	// App stuff.
+	bool running = true;
+	int options = 0;
+	void* platform_handle = NULL;
+	CF_OnUpdateFn* user_on_update = NULL;
+	SDL_Window* window = NULL;
+	CF_BackendType gfx_backend_type = CF_BACKEND_TYPE_INVALID;
+	bool debug_opengl = false;
+	cs_context_t* cute_sound = NULL;
+	void (*on_shader_changed_fn)(const char* path, void* udata) = NULL;
+	void* on_shader_changed_udata = NULL;
+	bool shader_directory_set = false;
+	Cute::CF_Path shader_directory;
+	Cute::Map<CF_ShaderFileInfo> shader_file_infos;
+	bool gfx_enabled = false;
+	float display_scale = 1.0f;
+	bool display_scale_was_changed = false;
+	float pixel_scale = 1.0f;   // Physical pixels per logical point (from SDL_GetWindowPixelDensity). Drives default-canvas sizing, AA, and glyph rasterization.
+	CF_Filter canvas_blit_filter = CF_FILTER_NEAREST; // Filter used when blitting the app canvas onto the screen, if their sizes differ (e.g. after cf_app_set_canvas_size). Defaults to nearest for a crisp/blocky pixel-art look.
+	bool sync_window = false;
+	int draw_call_count = 0;
+	int w = 0;
+	int h = 0;
+	int x = 0;
+	int y = 0;
+	int canvas_w = 0;
+	int canvas_h = 0;
+	CF_Color clear_color = { 0, 0, 0, 0 };
+	float clear_depth = 1.0f;
+	uint32_t clear_stencil = 0;
+	CF_Canvas offscreen_canvas = { };
+	CF_WindowState window_state;
+	CF_WindowState window_state_prev;
+	int sample_count = 0;
+	bool use_depth_stencil = false;
+	CF_PresentMode present_mode = CF_PRESENT_MODE_IMMEDIATE;
+	bool audio_needs_updates = false;
+	void* update_udata = NULL;
+	bool on_sound_finish_single_threaded = false;
+	Cute::Array<CF_Sound> on_sound_finish_queue;
+	void (*on_sound_finish)(CF_Sound, void*) = NULL;
+	void (*on_music_finish)(void*) = NULL;
+	bool on_music_finish_signal = false;
+	void* on_sound_finish_udata = NULL;
+	void* on_music_finish_udata = NULL;
+	CF_Mutex on_sound_finish_mutex = cf_make_mutex();
+	CF_Shader draw_shader = { 0 };
+	CF_Shader blit_shader = { 0 };
+	// Builtin vertex shader bytecode, compiled once at startup. Paired with
+	// user fragment bytecode by the *_from_bytecode draw/blit paths.
+	CF_ShaderBytecode draw_vs_bytecode = { 0 };
+	CF_ShaderBytecode blit_vs_bytecode = { 0 };
+	CF_Shader tile_shader = { 0 }; // Tiled draw path walk shader; null id when unavailable (GLES backend).
+	// Tiled draw path GPU binning compute shaders; null ids when unavailable (GLES backend).
+	CF_ComputeShader tile_zero_cs = { 0 };
+	CF_ComputeShader tile_count_cs = { 0 };
+	CF_ComputeShader tile_scan_cs = { 0 };
+	CF_ComputeShader tile_gather_cs = { 0 };
+
+	// Input stuff.
+	Cute::Array<char> ime_composition;
+	int ime_composition_cursor = 0;
+	int ime_composition_selection_len = 0;
+	Cute::Array<int> input_text;
+	int keys[512] = { 0 };
+	int keys_prev[512] = { 0 };
+	double keys_timestamp[512] = { 0 };
+	void (*key_callback)(CF_KeyButton key, bool true_down_false_up) = NULL;
+	CF_MouseState mouse, mouse_prev;
+	Cute::Array<CF_Touch> touches;
+
+	// SDL callback stuff
+	Cute::Array<CF_PendingEvent> pending_events;
+	Cute::Array<char> pending_event_text;
+	bool using_main_callbacks = false;
+
+	// Dear ImGui stuff.
+	bool using_imgui = false;
+
+	// Font stuff.
+	uint64_t font_image_id_gen = CF_FONT_ID_RANGE_LO;
+	Cute::Map<CF_Font*> fonts;
+	Cute::Map<CF_Pixel*> font_pixels;
+	Cute::Map<CF_TextEffectState> text_effect_states;
+	Cute::Map<CF_ParsedTextState> parsed_text_states;
+	Cute::Map<CF_TextEffectDef> text_effect_defs;
+
+	// Easy sprite stuff.
+	uint64_t easy_sprite_id_gen = CF_EASY_ID_RANGE_LO;
+	Cute::Map<CF_Image> easy_sprites;
+	Cute::Map<uint64_t> easy_sprite_id_cache;
+};
+
+#endif // CF_APP_INTERNAL_H

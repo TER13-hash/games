@@ -1,0 +1,3106 @@
+/*
+	Cute Framework
+	Copyright (C) 2026 Randy Gaul https://randygaul.github.io/
+
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
+
+	Unit tests for cute_spirv.h (the GLSL -> SPIR-V compiler).
+
+	Every successfully compiled module is round-tripped through spirv-val
+	(--target-env vulkan1.1) when the tool is available. Set CSPV_SPIRV_VAL to the
+	spirv-val executable path, or have it on PATH; tests warn and skip validation
+	otherwise (structural checks still run).
+*/
+
+#define CKIT_IMPLEMENTATION
+#include "cute/ckit.h"
+
+#define CUTE_SPIRV_IMPLEMENTATION
+#include "cute/cute_spirv.h"
+
+// Pull in the real builtin shader sources (and cute_shader.h, which is
+// dependency-free).
+#include "builtin_shaders.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+//--------------------------------------------------------------------------------------------------
+// Tiny test harness.
+
+static int g_checks = 0;
+static int g_fails = 0;
+static const char* g_current_test = "";
+
+#define CHECK(cond) do { \
+	g_checks++; \
+	if (!(cond)) { \
+		g_fails++; \
+		printf("FAIL %s (%s:%d): %s\n", g_current_test, __FILE__, __LINE__, #cond); \
+	} \
+} while (0)
+
+#define CHECK_MSG(cond, msg) do { \
+	g_checks++; \
+	if (!(cond)) { \
+		g_fails++; \
+		printf("FAIL %s (%s:%d): %s -- %s\n", g_current_test, __FILE__, __LINE__, #cond, (msg) ? (msg) : "(null)"); \
+	} \
+} while (0)
+
+#define TEST(fn) do { g_current_test = #fn; fn(); } while (0)
+
+//--------------------------------------------------------------------------------------------------
+// spirv-val integration.
+
+static bool g_has_spirv_val = false;
+static char* g_spirv_val_path; // ckit strings.
+static char* g_temp_spv;
+
+static void detect_spirv_val(void)
+{
+	const char* env = getenv("CSPV_SPIRV_VAL");
+	g_spirv_val_path = smake(env ? env : "spirv-val");
+	// Double-quoted wrapping avoids cmd.exe's outer-quote stripping.
+	char* cmd = sfmake("\"\"%s\" --version > nul 2>&1\"", g_spirv_val_path);
+	g_has_spirv_val = system(cmd) == 0;
+	sfree(cmd);
+	if (!g_has_spirv_val) {
+		printf("WARNING: spirv-val not found (set CSPV_SPIRV_VAL); skipping validation.\n");
+	}
+	const char* tmp = getenv("TEMP");
+	g_temp_spv = sfmake("%s\\cute_spirv_test.spv", tmp ? tmp : ".");
+}
+
+// Returns true if the module passes spirv-val (or validation is unavailable).
+static bool validate_spirv(const uint32_t* words, size_t count)
+{
+	if (!g_has_spirv_val) return true;
+	FILE* f = fopen(g_temp_spv, "wb");
+	if (!f) return false;
+	fwrite(words, sizeof(uint32_t), count, f);
+	fclose(f);
+	char* cmd = sfmake("\"\"%s\" --target-env vulkan1.1 \"%s\"\"", g_spirv_val_path, g_temp_spv);
+	bool ok = system(cmd) == 0;
+	sfree(cmd);
+	return ok;
+}
+
+//--------------------------------------------------------------------------------------------------
+// naga integration: every shader this suite compiles successfully is also transpiled to WGSL and
+// validated with naga (CSPV_NAGA = naga executable; default %USERPROFILE%\.cargo\bin\naga.exe,
+// then PATH). Validation runs with only shader_float16_in_float32 enabled -- core WebGPU (wgpu
+// grants it on every full WebGPU adapter; naga gates pack2x16float behind it). Identical
+// WGSL outputs validate once. CSPV_WGSL_DUMP names a directory to receive the failing modules,
+// CSPV_WGSL_ALL one to receive every module validated.
+
+static bool g_has_naga = false;
+static char* g_naga_path; // ckit strings.
+static char* g_temp_wgsl;
+static char* g_temp_naga_log;
+static CK_MAP(int) g_wgsl_seen;
+
+typedef struct wgsl_stat
+{
+	const char* what;
+	int total;
+	int valid;
+} wgsl_stat;
+
+enum { WGSL_TESTS, WGSL_BUILTIN, WGSL_SAMPLES, WGSL_EXTRA, WGSL_CAT_COUNT };
+static wgsl_stat g_wgsl_stats[WGSL_CAT_COUNT] = {
+	{ "compiler test shaders" }, { "builtin shaders" }, { "sample shaders" }, { "CSPV_EXTRA_SHADER_DIR shaders" },
+};
+static int g_wgsl_cat = WGSL_TESTS;
+static const char* g_wgsl_label = NULL; // File name of the shader under test, when known.
+
+static void detect_naga(void)
+{
+	const char* env = getenv("CSPV_NAGA");
+	const char* home = getenv("USERPROFILE");
+	if (env) g_naga_path = smake(env);
+	else if (home) g_naga_path = sfmake("%s\\.cargo\\bin\\naga.exe", home);
+	else g_naga_path = smake("naga");
+	char* cmd = sfmake("\"\"%s\" --version > nul 2>&1\"", g_naga_path);
+	g_has_naga = system(cmd) == 0;
+	sfree(cmd);
+	if (!g_has_naga && !env) {
+		sset(g_naga_path, "naga");
+		g_has_naga = system("naga --version > nul 2>&1") == 0;
+	}
+	if (!g_has_naga) printf("NOTE: naga not found (set CSPV_NAGA); skipping WGSL validation.\n");
+	const char* tmp = getenv("TEMP");
+	g_temp_wgsl = sfmake("%s\\cute_spirv_test.wgsl", tmp ? tmp : ".");
+	g_temp_naga_log = sfmake("%s\\cute_spirv_test_naga.txt", tmp ? tmp : ".");
+}
+
+static char* read_text_file(const char* path);
+
+static uint64_t wgsl_hash(const char* s)
+{
+	uint64_t h = 14695981039346656037ull;
+	for (; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+	return h ? h : 1;
+}
+
+static void wgsl_dump_failure(const char* wgsl)
+{
+	const char* dir = getenv("CSPV_WGSL_DUMP");
+	if (!dir) return;
+	static int n = 0;
+	char* path = sfmake("%s\\fail_%03d.wgsl", dir, n++);
+	FILE* f = fopen(path, "wb");
+	if (f) {
+		fwrite(wgsl, 1, strlen(wgsl), f);
+		fclose(f);
+	}
+	printf("  (dumped to %s)\n", path);
+	sfree(path);
+}
+
+// Returns true when naga accepts the module (or naga is unavailable).
+static bool validate_wgsl(const char* wgsl)
+{
+	if (!g_has_naga) return true;
+	uint64_t h = wgsl_hash(wgsl);
+	if (map_has(g_wgsl_seen, h)) {
+		// Corpus files count each time (a game's copy of a sample shader is still a file).
+		bool ok = map_get(g_wgsl_seen, h) == 1;
+		if (g_wgsl_cat != WGSL_TESTS) {
+			g_wgsl_stats[g_wgsl_cat].total++;
+			if (ok) g_wgsl_stats[g_wgsl_cat].valid++;
+		}
+		return ok;
+	}
+	g_wgsl_stats[g_wgsl_cat].total++;
+	FILE* f = fopen(g_temp_wgsl, "wb");
+	if (!f) return false;
+	fwrite(wgsl, 1, strlen(wgsl), f);
+	fclose(f);
+	char* cmd = sfmake("\"\"%s\" --capabilities shader_float16_in_float32 \"%s\" > \"%s\" 2>&1\"", g_naga_path, g_temp_wgsl, g_temp_naga_log);
+	bool ok = system(cmd) == 0;
+	sfree(cmd);
+	map_set(g_wgsl_seen, h, ok ? 1 : 2);
+	const char* all_dir = getenv("CSPV_WGSL_ALL");
+	if (all_dir) {
+		static int all_n = 0;
+		char* path = sfmake("%s/%04d_%s.wgsl", all_dir, all_n++, g_current_test);
+		FILE* af = fopen(path, "wb");
+		if (af) {
+			fwrite(wgsl, 1, strlen(wgsl), af);
+			fclose(af);
+		}
+		sfree(path);
+	}
+	if (ok) {
+		g_wgsl_stats[g_wgsl_cat].valid++;
+	} else {
+		char* log = read_text_file(g_temp_naga_log);
+		printf("--- naga rejected WGSL (%s%s%s): ---\n%s\n", g_current_test, g_wgsl_label ? ", " : "", g_wgsl_label ? g_wgsl_label : "", log ? log : "(no output)");
+		free(log);
+		wgsl_dump_failure(wgsl);
+	}
+	return ok;
+}
+
+// Every successful compile in this file also goes through the WGSL emitter and naga, so the
+// whole suite doubles as WGSL coverage. Compiles that already request WGSL check their own.
+static CSPV_Result wgsl_checked_compile(const char* src, CSPV_Stage stage, const CSPV_Options* opts)
+{
+	CSPV_Result r = (cspv_compile_ex)(src, stage, opts);
+	if (!r.success || !g_has_naga || (opts && (opts->emit_wgsl || opts->preprocess_only))) return r;
+	CSPV_Options o;
+	if (opts) o = *opts;
+	else memset(&o, 0, sizeof(o));
+	o.emit_wgsl = true;
+	o.emit_glsl300 = false;
+	o.emit_hlsl = false;
+	o.emit_msl = false;
+	o.return_preprocessed = false;
+	CSPV_Result w = (cspv_compile_ex)(src, stage, &o);
+	if (!w.success) {
+		g_wgsl_stats[g_wgsl_cat].total++;
+		printf("--- WGSL emission failed (%s%s%s): %s\n", g_current_test, g_wgsl_label ? ", " : "", g_wgsl_label ? g_wgsl_label : "", w.error_message);
+		CHECK_MSG(false, "WGSL emission failed");
+	} else {
+		CHECK_MSG(validate_wgsl(w.wgsl), g_wgsl_label ? g_wgsl_label : "naga rejected the WGSL");
+	}
+	cspv_free(&w);
+	return r;
+}
+#define cspv_compile_ex(src, stage, opts) wgsl_checked_compile(src, stage, opts)
+#define cspv_compile(src, stage) wgsl_checked_compile(src, stage, NULL)
+
+//--------------------------------------------------------------------------------------------------
+// Compile helpers.
+
+static void expect_ok_ex(CSPV_Stage stage, const char* src, const CSPV_Options* opts)
+{
+	CSPV_Result r = cspv_compile_ex(src, stage, opts);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CHECK(r.word_count > 5);
+		CHECK(r.spirv[0] == 0x07230203u); // Magic.
+		CHECK(r.spirv[1] == 0x00010300u); // SPIR-V 1.3.
+		CHECK(r.spirv[3] > 0);            // Id bound.
+		bool valid = validate_spirv(r.spirv, r.word_count);
+		if (!valid) {
+			// Dump the failing shader source for debugging.
+			printf("--- spirv-val failed for shader: ---\n%s\n", src);
+		}
+		CHECK(valid);
+	}
+	cspv_free(&r);
+}
+
+static void expect_ok(CSPV_Stage stage, const char* src)
+{
+	expect_ok_ex(stage, src, NULL);
+}
+
+static void expect_err_ex(CSPV_Stage stage, const char* src, const char* expect_substr, const CSPV_Options* opts)
+{
+	CSPV_Result r = cspv_compile_ex(src, stage, opts);
+	CHECK_MSG(!r.success, "expected a compile error but compilation succeeded");
+	if (!r.success) {
+		CHECK_MSG(r.error_message && strstr(r.error_message, expect_substr) != NULL, r.error_message);
+	}
+	cspv_free(&r);
+}
+
+static void expect_err(CSPV_Stage stage, const char* src, const char* expect_substr)
+{
+	expect_err_ex(stage, src, expect_substr, NULL);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Preprocessor tests.
+
+static const char* test_include_resolve(const char* path, void* user)
+{
+	(void)user;
+	if (sequ(path, "util.shd")) return "float util_one() { return 1.0; }\n";
+	if (sequ(path, "nested.shd")) return "#include \"util.shd\"\nfloat two() { return util_one() + 1.0; }\n";
+	if (sequ(path, "bad.shd")) return "float broken() {\n\treturn oops;\n}\n";
+	return NULL;
+}
+
+static void test_preprocessor(void)
+{
+	// Object-like and function-like macros.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define COLOR vec4(1, 0, 0, 1)\n"
+		"#define SCALE(x, s) ((x) * (s))\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = SCALE(COLOR, 0.5); }\n");
+	// Macro in macro + self-reference guard.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define A B\n"
+		"#define B 2.0\n"
+		"#define REC REC\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { float REC = 3.0; result = vec4(A + REC); }\n");
+	// #undef: X is usable as a plain identifier afterwards.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define X vec4\n"
+		"#undef X\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { float X = 2.0; result = vec4(X); }\n");
+	// Conditionals.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define FEATURE 1\n"
+		"layout(location = 0) out vec4 result;\n"
+		"#if FEATURE && defined(FEATURE) && !defined(MISSING)\n"
+		"void main() { result = vec4(1); }\n"
+		"#else\n"
+		"this is not even glsl\n"
+		"#endif\n");
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"#ifdef MISSING\n"
+		"garbage {\n"
+		"#elif 2 + 2 == 4\n"
+		"void main() { result = vec4(1); }\n"
+		"#else\n"
+		"more garbage\n"
+		"#endif\n");
+	// Nested conditionals inside an inactive region stay skipped.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"#ifdef MISSING\n"
+		"#ifdef ALSO_MISSING\n"
+		"junk\n"
+		"#endif\n"
+		"junk\n"
+		"#endif\n"
+		"void main() { result = vec4(1); }\n");
+	// Line continuation in a #define.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define LONG(x) \\\n"
+		"	((x) + 1.0)\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(LONG(2.0)); }\n");
+
+	// Multi-line function-like macro invocations, matching the C preprocessor: an
+	// argument list may span lines with no backslashes.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define MAKE_STRUCT(X) struct Data { X };\n"
+		"MAKE_STRUCT(\n"
+		"	float a;\n"
+		"	float b;\n"
+		")\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { Data d; d.a = 1.0; d.b = 2.0; result = vec4(d.a + d.b); }\n");
+	// Arguments split on top-level commas across lines, nested invocations included.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define ADD(a, b) ((a) + (b))\n"
+		"#define MUL(a, b) ((a) * (b))\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() {\n"
+		"	result = vec4(ADD(\n"
+		"		1.0,\n"
+		"		MUL(2.0,\n"
+		"		    3.0)\n"
+		"	));\n"
+		"}\n");
+	// The '(' itself may open on a later line, blank lines in between included.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define ONE(x) (x)\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(ONE\n"
+		"\n"
+		"	(1.0)); }\n");
+	// But a bare macro name never drags an unrelated next line up with it.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define F(x) (x)\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() {\n"
+		"	float F\n"
+		"	= 1.0;\n"
+		"	result = vec4(F);\n"
+		"}\n");
+	// Backslash continuations inside a multi-line argument list still splice.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define ADD(a, b) ((a) + (b))\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(ADD(\n"
+		"	1.0, \\\n"
+		"	2.0)); }\n");
+	// An invocation in a skipped conditional region absorbs nothing.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#define M(x) x\n"
+		"layout(location = 0) out vec4 result;\n"
+		"#ifdef MISSING\n"
+		"M(\n"
+		"	this is not even glsl\n"
+		")\n"
+		"#endif\n"
+		"void main() { result = vec4(1); }\n");
+	// Lines after a multi-line invocation keep their own numbers in errors.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"#define ADD(a, b) ((a) + (b))\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() {\n"
+		"	float x = ADD(\n"
+		"		1.0,\n"
+		"		2.0);\n"
+		"	result = vec4(nope);\n"
+		"}\n", ":7:");
+	// An argument list left open at end-of-file errors instead of truncating.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"#define ADD(a, b) ((a) + (b))\n"
+		"void main() { float x = ADD(1.0, 2.0; }\n", "unterminated argument list");
+	// A directive never becomes argument text.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"#define ADD(a, b) ((a) + (b))\n"
+		"float x = ADD(1.0,\n"
+		"#define OOPS 1\n"
+		"2.0);\n"
+		"void main() { }\n", "unterminated argument list");
+
+	// #version/#extension/#pragma ignored.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"#version 450\n"
+		"#extension GL_ARB_whatever : enable\n"
+		"#pragma something\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(1); }\n");
+
+	// Includes with automatic include guards (double-include would redefine).
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.include_resolve = test_include_resolve;
+	expect_ok_ex(CSPV_STAGE_FRAGMENT,
+		"#include \"util.shd\"\n"
+		"#include \"nested.shd\"\n"
+		"#include \"util.shd\"\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(two()); }\n", &opts);
+
+	// Builtin defines from options.
+	CSPV_Define defines[2];
+	defines[0].name = "CF_FRAGMENT";
+	defines[0].value = NULL;
+	defines[1].name = "HALF";
+	defines[1].value = "0.5";
+	opts.num_defines = 2;
+	opts.defines = defines;
+	expect_ok_ex(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"#ifdef CF_FRAGMENT\n"
+		"void main() { result = vec4(HALF); }\n"
+		"#endif\n", &opts);
+	opts.num_defines = 0;
+
+	// Errors: location reporting inside an include names the included file.
+	expect_err_ex(CSPV_STAGE_FRAGMENT,
+		"#include \"bad.shd\"\n"
+		"void main() { }\n", "bad.shd:2", &opts);
+	// The display_name hook renames a file in error messages (the mechanism CF
+	// uses to report draw-shader-stub errors under the user's shader path).
+	{
+		CSPV_Options rename_opts = opts;
+		struct local {
+			static const char* rename(const char* path, void* user) {
+				(void)user;
+				return sequ(path, "bad.shd") ? "my_actual_shader.shd" : NULL;
+			}
+		};
+		rename_opts.display_name = local::rename;
+		expect_err_ex(CSPV_STAGE_FRAGMENT,
+			"#include \"bad.shd\"\n"
+			"void main() { }\n", "my_actual_shader.shd:2", &rename_opts);
+	}
+	expect_err_ex(CSPV_STAGE_FRAGMENT, "#include \"missing.shd\"\nvoid main() { }\n", "cannot open include file", &opts);
+	expect_err(CSPV_STAGE_FRAGMENT, "#include \"x.shd\"\nvoid main() { }\n", "no include resolver");
+	expect_err(CSPV_STAGE_FRAGMENT, "#garbage\nvoid main() { }\n", "unknown preprocessor directive");
+	expect_err(CSPV_STAGE_FRAGMENT, "#ifdef X\nvoid main() { }\n", "missing #endif");
+	expect_err(CSPV_STAGE_FRAGMENT, "#endif\nvoid main() { }\n", "#endif without #if");
+	expect_err(CSPV_STAGE_FRAGMENT, "#ifdef X\n#else\n#else\n#endif\nvoid main() { }\n", "duplicate #else");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"#define M(a, b) a + b\n"
+		"void main() { float x = M(1.0); }\n", "expects 2 argument");
+}
+
+//--------------------------------------------------------------------------------------------------
+// Standalone test shaders exercising the builtin utility-module code (gamma/blend
+// bodies wrapped with a main; the real modules compile verbatim via the corpus test).
+
+static const char* s_gamma_fs =
+"layout(location = 0) out vec4 result;\n"
+"vec4 gamma(vec4 c)\n"
+"{\n"
+"	return vec4(pow(abs(c.rgb), vec3(1.0/2.2)), c.a);\n"
+"}\n"
+"vec4 de_gamma(vec4 c)\n"
+"{\n"
+"	return vec4(pow(abs(c.rgb), vec3(2.2)), c.a);\n"
+"}\n"
+"void main()\n"
+"{\n"
+"	result = gamma(de_gamma(vec4(0.5)));\n"
+"}\n";
+
+// blend.shd (rgb<->hsv + overload pair), exercises ternaries with vector arms,
+// mod-with-splat, user-function overloads.
+static const char* s_blend_fs =
+"layout(location = 0) out vec4 result;\n"
+"vec3 rgb_to_hsv(vec3 c)\n"
+"{\n"
+"	vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);\n"
+"	vec4 p = c.g < c.b ? vec4(c.bg, K.wz) : vec4(c.gb, K.xy);\n"
+"	vec4 q = c.r < p.x ? vec4(p.xyw, c.r) : vec4(c.r, p.yzx);\n"
+"	float d = q.x - min(q.w, q.y);\n"
+"	float e = 1.0e-10;\n"
+"	return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);\n"
+"}\n"
+"vec3 hsv_to_rgb(vec3 c)\n"
+"{\n"
+"	vec3 rgb = clamp(abs(mod(c.x*6.0+vec3(0.0,4.0,2.0),6.0)-3.0)-1.0, 0.0, 1.0);\n"
+"	rgb = rgb*rgb*(3.0-2.0*rgb);\n"
+"	return c.z * mix(vec3(1.0), rgb, c.y);\n"
+"}\n"
+"vec3 hue(vec3 base, vec3 tint)\n"
+"{\n"
+"	base = rgb_to_hsv(base);\n"
+"	tint = rgb_to_hsv(tint);\n"
+"	return hsv_to_rgb(vec3(tint.r, base.gb));\n"
+"}\n"
+"vec4 hue(vec4 base, vec4 tint)\n"
+"{\n"
+"	return vec4(hue(base.rgb, tint.rgb), base.a);\n"
+"}\n"
+"void main()\n"
+"{\n"
+"	result = hue(vec4(0.25), vec4(0.75));\n"
+"}\n";
+
+//--------------------------------------------------------------------------------------------------
+// Full builtin-shader corpus, mirroring how cute_graphics.cpp invokes the compiler:
+// no defines, the builtin include modules, and shader_stub.shd resolving to either
+// the default stub or an injected user shader (passed via opts.user).
+
+static const char* corpus_resolve(const char* path, void* user)
+{
+	if (user && sequ(path, "shader_stub.shd")) return (const char*)user;
+	for (int i = 0; i < (int)(sizeof(s_builtin_includes) / sizeof(s_builtin_includes[0])); i++) {
+		if (sequ(path, s_builtin_includes[i].name)) return s_builtin_includes[i].content;
+	}
+	if (sequ(path, "shader_stub.shd")) return s_shader_stub;
+	return NULL;
+}
+
+static void test_corpus_builtin_full(void)
+{
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.include_resolve = corpus_resolve;
+
+	// cute_graphics injects the payload storage buffer's binding slot (see
+	// cf_compute_payload_binding); mirror the default here.
+	CSPV_Define payload_define;
+	payload_define.name = "CF_PAYLOAD_BINDING";
+	payload_define.value = "1";
+	opts.num_defines = 1;
+	opts.defines = &payload_define;
+
+	// Options for the GLES texel-fetch flavor (single-source: CF_GLES selects it).
+	CSPV_Define gles_defines[2];
+	gles_defines[0] = payload_define;
+	gles_defines[1].name = "CF_GLES";
+	gles_defines[1].value = "1";
+	CSPV_Options gles_opts = opts;
+	gles_opts.num_defines = 2;
+	gles_opts.defines = gles_defines;
+
+	// Every builtin vertex/fragment pair, verbatim, with the default stub -- and the
+	// CF_GLES flavor for the pairs that have one.
+	for (int i = 0; i < (int)(sizeof(s_builtin_shader_sources) / sizeof(s_builtin_shader_sources[0])); i++) {
+		expect_ok_ex(CSPV_STAGE_VERTEX, s_builtin_shader_sources[i].vertex, &opts);
+		expect_ok_ex(CSPV_STAGE_FRAGMENT, s_builtin_shader_sources[i].fragment, &opts);
+		if (s_builtin_shader_sources[i].has_gles_flavor) {
+			expect_ok_ex(CSPV_STAGE_VERTEX, s_builtin_shader_sources[i].vertex, &gles_opts);
+			expect_ok_ex(CSPV_STAGE_FRAGMENT, s_builtin_shader_sources[i].fragment, &gles_opts);
+		}
+	}
+
+	// Every builtin compute shader (the tiled path's binning pipeline).
+	for (int i = 0; i < (int)(sizeof(s_builtin_compute_shader_sources) / sizeof(s_builtin_compute_shader_sources[0])); i++) {
+		expect_ok_ex(CSPV_STAGE_COMPUTE, s_builtin_compute_shader_sources[i].source, &opts);
+	}
+
+	// A custom draw shader spliced in through the stub, like cf_make_draw_shader.
+	opts.user = (void*)
+		"vec4 shader(vec4 color, ShaderParams params)\n"
+		"{\n"
+		"	vec4 hued = vec4(hue(color.rgb, params.attributes.rgb), color.a);\n"
+		"	float d = distance_aabb(params.uv - 0.5, vec2(0.25));\n"
+		"	return mix(gamma(hued), color, smoothstep(0.0, params.attributes.a, d));\n"
+		"}\n";
+	expect_ok_ex(CSPV_STAGE_FRAGMENT, s_draw_fs, &opts);
+
+	// Blit shaders only include smooth_uv.shd, so their user stubs are simpler.
+	opts.user = (void*)
+		"vec4 shader(vec4 color, ShaderParams params)\n"
+		"{\n"
+		"	return color * params.attributes;\n"
+		"}\n";
+	expect_ok_ex(CSPV_STAGE_FRAGMENT, s_blit_fs, &opts);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Corpus tests.
+
+static void test_corpus_basic(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, s_gamma_fs);
+	expect_ok(CSPV_STAGE_FRAGMENT, s_blend_fs);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Feature tests (positive).
+
+#define FS_MAIN(body) \
+	"layout(location = 0) out vec4 result;\n" \
+	"void main()\n{\n" body "\n}\n"
+
+static void test_expressions(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(1.0 + 2.0 * 3.0 - 4.0 / 2.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 5.0; x += 1.0; x -= 2.0; x *= 3.0; x /= 4.0; result = vec4(x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("int i = 7 % 3; uint u = 8u >> 2u; int j = i << 1; result = vec4(float(i + j), float(u), 0, 1);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("int i = 6 & 3; int j = 6 | 3; int k = 6 ^ 3; int m = ~6; result = vec4(float(i + j + k + m));"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 1.0; x++; ++x; x--; --x; result = vec4(x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(1, 2); v.x = 3.0; v.y += 1.0; result = vec4(v, 0, 1);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec4 v = vec4(1, 2, 3, 4); v.xy = v.zw; v.wzyx = v; result = v;"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec3 v = vec3(1); float f = v.z; result = vec4(v.xy, f, v.r);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("bool b = 1.0 < 2.0 && 3 > 2 || !(4u >= 5u); result = vec4(b ? 1.0 : 0.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 2.0; float y = x == 2.0 ? 1.0 : 0.0; result = vec4(y != 0.0 ? y : x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec3 a = vec3(1); vec3 b = vec3(2); vec3 c = true ? a : b; result = vec4(c, 1);"));
+	// Implicit conversions: int -> float, int -> uint, scalar-vector ops.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 1; vec2 v = vec2(1, 2) * 2.0; vec2 w = 3.0 * v; result = vec4(v + w, x, 1);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("uint u = 5; float f = u + 1.5; result = vec4(f);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(-1.0); result = -result; int i = -3; result.x = float(-i);"));
+}
+
+static void test_constructors(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(1);"));                      // Splat with int -> float.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(1.0, 2.0, 3.0, 4.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(vec2(1), vec2(2));"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(vec3(1), 1.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec4 v = vec4(1, 2, 3, 4); vec3 s = vec3(v); vec2 t = vec2(v); result = vec4(s, t.x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float f = float(3); int i = int(3.7); uint u = uint(5); bool b = i > 2; result = vec4(f, float(i), float(u), b ? 1.0 : 0.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("ivec2 iv = ivec2(1, 2); uvec3 uv = uvec3(1u); result = vec4(float(iv.x), float(uv.y), 0, 1);"));
+}
+
+static void test_intrinsics(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"vec3 v = vec3(0.5);\n"
+		"v = pow(abs(v), vec3(2.2));\n"
+		"v = mix(v, vec3(1.0), 0.5);\n"
+		"v = clamp(v, 0.0, 1.0);\n"
+		"v = min(max(v, vec3(0.1)), 0.9);\n"
+		"float s = smoothstep(0.0, 1.0, v.x) + step(0.5, v.y) + fract(v.z) + floor(v.x) + ceil(v.y) + round(v.z) + trunc(v.x);\n"
+		"s += sqrt(v.x) + inversesqrt(v.y) + exp(v.z) + log(v.x) + exp2(v.y) + log2(v.z) + sign(v.x);\n"
+		"s += sin(v.x) + cos(v.y) + tan(v.z) + asin(0.5) + acos(0.5) + atan(1.0);\n"
+		"s += length(v) + distance(v, vec3(0)) + dot(v, v);\n"
+		"vec3 n = normalize(v);\n"
+		"vec3 c = cross(n, vec3(0, 1, 0));\n"
+		"vec3 r = reflect(n, c);\n"
+		"s += mod(7.5, 2.0);\n"
+		"result = vec4(r, s);"));
+	// Derivatives (fragment only).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(0.5); result = vec4(dFdx(v), dFdy(v)) + vec4(fwidth(v), 0, 0);"));
+}
+
+static void test_control_flow(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 0.0; if (x < 1.0) { x = 2.0; } result = vec4(x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 0.0; if (x < 1.0) x = 2.0; else x = 3.0; result = vec4(x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float acc = 0.0;\n"
+		"for (int i = 0; i < 10; ++i) {\n"
+		"	if (i == 3) continue;\n"
+		"	if (i == 8) break;\n"
+		"	acc += float(i);\n"
+		"}\n"
+		"result = vec4(acc);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"int i = 0;\n"
+		"while (i < 5) { i++; }\n"
+		"result = vec4(float(i));"));
+	// Nested loops with break/continue targeting the correct loop.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float acc = 0.0;\n"
+		"for (int i = 0; i < 4; ++i) {\n"
+		"	for (int j = 0; j < 4; ++j) {\n"
+		"		if (j == 2) break;\n"
+		"		acc += 1.0;\n"
+		"	}\n"
+		"}\n"
+		"result = vec4(acc);"));
+	// Statements after return go into an unreachable block.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(1); return; result = vec4(2);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("if (true) { discard; } result = vec4(1);"));
+	// For loop with no condition (infinite + break).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("int i = 0; for (;;) { i++; if (i > 3) break; } result = vec4(float(i));"));
+	// Empty for clauses combinations.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("int i = 0; for (; i < 3;) { i++; } result = vec4(float(i));"));
+}
+
+static void test_functions(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(0);") );
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"float add(float a, float b) { return a + b; }\n"
+		"void main() { result = vec4(add(1.0, 2.0)); }\n");
+	// Overloads by arity and by type.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"float pick(float a) { return a; }\n"
+		"float pick(float a, float b) { return a + b; }\n"
+		"vec2 pick(vec2 a) { return a; }\n"
+		"void main() { result = vec4(pick(1.0), pick(1.0, 2.0), pick(vec2(3.0))); }\n");
+	// Implicit conversion at the call site (int literal -> float param).
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"float f(float x) { return x; }\n"
+		"void main() { result = vec4(f(1)); }\n");
+	// Parameters are mutable.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"float f(float x) { x += 1.0; return x; }\n"
+		"void main() { result = vec4(f(1.0)); }\n");
+	// void function with early return.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"void nop(float x) { if (x > 0.0) return; }\n"
+		"void main() { nop(1.0); result = vec4(1); }\n");
+	// out/inout parameters (copy-in/copy-out), including swizzle lvalue args.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"void split(float v, out float lo, out float hi) { lo = fract(v); hi = floor(v); }\n"
+		"void accum(inout vec3 sum, inout float weight, vec3 v, float w) { sum += v * w; weight += w; }\n"
+		"void main() {\n"
+		"	float lo; float hi;\n"
+		"	split(3.75, lo, hi);\n"
+		"	vec3 sum = vec3(0); float weight = 0.0;\n"
+		"	accum(sum, weight, vec3(1, 2, 3), 0.5);\n"
+		"	vec4 v = vec4(0);\n"
+		"	split(2.5, v.x, v.y);\n"
+		"	result = vec4(sum, lo + hi + weight) + v;\n"
+		"}\n");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"void f(out float x) { x = 1.0; }\n"
+		"void main() { f(2.0); result = vec4(1); }\n", "must be assignable");
+	// Constant-expression array sizes: #define arithmetic and const globals.
+	expect_ok(CSPV_STAGE_COMPUTE,
+		"#define TILE_W 8\n"
+		"const int PAD = 2;\n"
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer b { float data[]; };\n"
+		"shared vec3 s_tile[TILE_W * TILE_W];\n"
+		"shared float s_edge[TILE_W + PAD];\n"
+		"void main() {\n"
+		"	uint i = gl_LocalInvocationIndex;\n"
+		"	s_tile[i % 64u] = vec3(1);\n"
+		"	s_edge[i % 10u] = 2.0;\n"
+		"	barrier();\n"
+		"	data[i] = s_tile[0].x + s_edge[0] + float(s_tile.length() + s_edge.length());\n"
+		"}\n");
+	// 'in' param qualifier and (void) param list.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"float f(in float x) { return x; }\n"
+		"float g(void) { return 2.0; }\n"
+		"void main() { result = vec4(f(1.0) + g()); }\n");
+}
+
+static void test_io_and_uniforms(void)
+{
+	// Vertex inputs/outputs + gl_Position.
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(location = 0) in vec2 pos;\n"
+		"layout(location = 1) in vec4 col;\n"
+		"layout(location = 0) out vec4 v_col;\n"
+		"void main() { v_col = col; gl_Position = vec4(pos, 0, 1); }\n");
+	// Flat interpolation.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) flat in int v_n;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(float(v_n)); }\n");
+	// Integer fragment input is implicitly flat even without the qualifier.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in flat int v_n;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(float(v_n)); }\n");
+	// Multi-member uniform block with std140 offsets.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 3, binding = 0) uniform uniform_block {\n"
+		"	float u_a;\n"
+		"	vec2 u_b;\n"
+		"	vec3 u_c;\n"
+		"	vec4 u_d;\n"
+		"	int u_e;\n"
+		"};\n"
+		"void main() { result = vec4(u_a) + vec4(u_b, 0, 0) + vec4(u_c, 0) + u_d + vec4(float(u_e)); }\n");
+	// Two samplers and a block.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in vec2 uv;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D u_a;\n"
+		"layout(set = 2, binding = 1) uniform sampler2D u_b;\n"
+		"void main() { result = texture(u_a, uv) + texture(u_b, uv); }\n");
+	// texture() in a vertex shader uses an explicit LOD.
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+		"void main() { gl_Position = texture(u_tex, vec2(0.5)); }\n");
+}
+
+static void test_matrices(void)
+{
+	// Constructors: diagonal, column vectors, flat scalars (column-major).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("mat4 m = mat4(1.0); result = m * vec4(1);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"mat2 m = mat2(vec2(1, 0), vec2(0, 1));\n"
+		"vec2 v = m * vec2(0.5);\n"
+		"result = vec4(v, 0, 1);"));
+	// The sdf_core rotation idiom: mat2 from 4 scalars.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float c = cos(0.5); float s = sin(0.5);\n"
+		"mat2 rot = mat2(c, -s, s, c);\n"
+		"vec2 v = rot * vec2(1, 0);\n"
+		"result = vec4(v, 0, 1);"));
+	// mat*mat, vec*mat, mat*scalar, scalar*mat, negate.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"mat3 a = mat3(1.0); mat3 b = mat3(2.0);\n"
+		"mat3 c = a * b; c = c * 0.5; c = 2.0 * c; c = -c;\n"
+		"vec3 v = vec3(1) * c; v = c * v;\n"
+		"result = vec4(v, 1);"));
+	// Matrix indexing: read and write columns, chained scalar access.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"mat4 m = mat4(1.0);\n"
+		"m[3] = vec4(1, 2, 3, 4);\n"
+		"vec4 col = m[3];\n"
+		"float f = m[0][0] + m[3].y;\n"
+		"result = col * f;"));
+	// Dynamic index.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"mat4 m = mat4(2.0);\n"
+		"vec4 acc = vec4(0);\n"
+		"for (int i = 0; i < 4; ++i) acc += m[i];\n"
+		"result = acc;"));
+	// transpose/inverse/determinant.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"mat3 m = mat3(2.0);\n"
+		"mat3 t = transpose(m);\n"
+		"mat3 inv = inverse(m);\n"
+		"float d = determinant(m);\n"
+		"result = vec4((t * inv * vec3(1)), d);"));
+	// mat4 uniform block member (std140: ColMajor + MatrixStride 16).
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(location = 0) in vec2 pos;\n"
+		"layout(set = 1, binding = 0) uniform uniform_block {\n"
+		"	mat4 u_mvp;\n"
+		"	vec2 u_offset;\n"
+		"};\n"
+		"void main() { gl_Position = u_mvp * vec4(pos + u_offset, 0, 1); }\n");
+	// Vector indexing (read + write, dynamic).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"vec4 v = vec4(1, 2, 3, 4);\n"
+		"v[0] = 5.0;\n"
+		"float sum = 0.0;\n"
+		"for (int i = 0; i < 4; ++i) sum += v[i];\n"
+		"int j = 2;\n"
+		"v[j] = sum;\n"
+		"result = v;"));
+}
+
+static void test_switch_and_do(void)
+{
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"int t = 2; float x = 0.0;\n"
+		"switch (t) {\n"
+		"case 0: x = 1.0; break;\n"
+		"case 1:\n"
+		"case 2: x = 2.0; break;\n"
+		"case -1: x = 3.0; break;\n"
+		"default: x = 4.0; break;\n"
+		"}\n"
+		"result = vec4(x);"));
+	// Fallthrough into the next group and no default.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"int t = 1; float x = 0.0;\n"
+		"switch (t) {\n"
+		"case 0: x += 1.0;\n"
+		"case 1: x += 2.0;\n"
+		"}\n"
+		"result = vec4(x);"));
+	// switch nested in a loop: continue targets the loop, break the switch.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float x = 0.0;\n"
+		"for (int i = 0; i < 4; ++i) {\n"
+		"	switch (i) {\n"
+		"	case 0: continue;\n"
+		"	case 1: x += 1.0; break;\n"
+		"	default: x += 2.0; break;\n"
+		"	}\n"
+		"	x += 0.5;\n"
+		"}\n"
+		"result = vec4(x);"));
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"int i = 0;\n"
+		"do { i++; } while (i < 5);\n"
+		"do { i++; if (i > 8) break; } while (true);\n"
+		"result = vec4(float(i));"));
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("switch (1) { float x = 1.0; }"), "statement before first 'case'");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("switch (1.0) { case 0: break; }"), "selector must be int or uint");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("switch (1) { case x: break; }"), "integer literal");
+}
+
+static void test_intrinsics_extended(void)
+{
+	// Bit casts.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"uint u = floatBitsToUint(1.5);\n"
+		"int i = floatBitsToInt(2.5);\n"
+		"float a = uintBitsToFloat(u) + intBitsToFloat(i);\n"
+		"uvec2 uv = floatBitsToUint(vec2(1, 2));\n"
+		"result = vec4(a, uintBitsToFloat(uv), 1);"));
+	// Pack/unpack.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"uint p = packUnorm4x8(vec4(0.5));\n"
+		"vec4 v = unpackUnorm4x8(p);\n"
+		"uint h = packHalf2x16(vec2(1.5, 2.5));\n"
+		"vec2 hv = unpackHalf2x16(h);\n"
+		"uint n = packUnorm2x16(vec2(0.25));\n"
+		"vec2 nv = unpackUnorm2x16(n) + unpackSnorm2x16(packSnorm2x16(vec2(0.5)));\n"
+		"result = v + vec4(hv, nv);"));
+	// Integer min/max/clamp/abs/sign.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"int a = min(3, 5); int b = max(-2, 7); int c = clamp(10, 0, 4); int d = abs(-9); int e = sign(-3);\n"
+		"uint ua = min(3u, 5u); uint ub = clamp(9u, 0u, 4u);\n"
+		"ivec2 vi = clamp(ivec2(5), ivec2(0), ivec2(3));\n"
+		"result = vec4(float(a + b + c + d + e), float(ua + ub), float(vi.x), 1);"));
+	// Vector relational + all/any/not + mix-select + isnan/isinf.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"vec3 a = vec3(1, 2, 3); vec3 b = vec3(2);\n"
+		"bvec3 lt = lessThan(a, b);\n"
+		"bvec3 ge = greaterThanEqual(a, b);\n"
+		"bvec3 eq = equal(ivec3(1), ivec3(1));\n"
+		"bvec3 ne = notEqual(uvec3(1u), uvec3(2u));\n"
+		"bool every = all(lt); bool some = any(ge);\n"
+		"bvec3 inv = not(lt);\n"
+		"vec3 m = mix(a, b, lt);\n"
+		"bool nan = any(isnan(a)) || any(isinf(b));\n"
+		"result = vec4(m, (every || some || inv.x || nan || eq.x || ne.x) ? 1.0 : 0.0);"));
+	// atan2, textureLod, texelFetch, textureSize.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in vec2 uv;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D u_tex;\n"
+		"void main() {\n"
+		"	float ang = atan(uv.y, uv.x) + atan(0.5);\n"
+		"	vec4 a = textureLod(u_tex, uv, 0.0);\n"
+		"	vec4 b = texelFetch(u_tex, ivec2(int(uv.x) & 1023, int(uv.y) >> 10), 0);\n"
+		"	ivec2 size = textureSize(u_tex, 0);\n"
+		"	result = a + b + vec4(ang, float(size.x), float(size.y), 1);\n"
+		"}\n");
+	// texelFetch in a vertex shader (the GLES storage-buffer-emulation idiom).
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 0, binding = 0) uniform sampler2D u_data;\n"
+		"void main() { gl_Position = texelFetch(u_data, ivec2(0, 0), 0); }\n");
+}
+
+static void test_structs_arrays_globals(void)
+{
+	// Struct declaration, constructor, field access (read/write), nesting in arrays.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"struct ShapeParams {\n"
+		"	vec2 center;\n"
+		"	float radius;\n"
+		"	vec4 attributes;\n"
+		"};\n"
+		"float eval(ShapeParams p) { return p.radius + p.center.x; }\n"
+		"void main() {\n"
+		"	ShapeParams p = ShapeParams(vec2(1, 2), 3.0, vec4(4));\n"
+		"	p.radius = 5.0;\n"
+		"	p.center.y += 1.0;\n"
+		"	result = p.attributes * eval(p);\n"
+		"}\n");
+	// Local arrays: declaration, constructor init, indexing, .length().
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float weights[3] = float[](0.25, 0.5, 0.25);\n"
+		"vec2 offsets[2] = vec2[2](vec2(-1, 0), vec2(1, 0));\n"
+		"float sum = 0.0;\n"
+		"for (int i = 0; i < weights.length(); ++i) sum += weights[i];\n"
+		"offsets[1] = offsets[0] * -1.0;\n"
+		"result = vec4(offsets[0] + offsets[1], sum, 1);"));
+	// Struct array + dynamic index + field chain.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"struct Cmd { vec2 pos; float w; };\n"
+		"void main() {\n"
+		"	Cmd cmds[2] = Cmd[](Cmd(vec2(1), 2.0), Cmd(vec2(3), 4.0));\n"
+		"	float acc = 0.0;\n"
+		"	for (int i = 0; i < 2; ++i) acc += cmds[i].w + cmds[i].pos.x;\n"
+		"	result = vec4(acc);\n"
+		"}\n");
+	// Global const scalars/vectors/arrays with folded initializers, plain globals.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"const float PI = 3.14159;\n"
+		"const float HALF_PI = 3.14159 / 2.0;\n"
+		"const int N = 4;\n"
+		"const vec2 UP = vec2(0.0, 1.0);\n"
+		"const float KERNEL[3] = float[](1.0 / 4.0, 0.5, 0.25);\n"
+		"float g_acc;\n"
+		"void main() {\n"
+		"	g_acc = PI + HALF_PI + float(N) + KERNEL[0] + KERNEL[2];\n"
+		"	result = vec4(UP * g_acc, 0, 1);\n"
+		"}\n");
+	// Errors.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"struct S { float x; };\nstruct S { float y; };\nvoid main() { }", "redefinition of type 'S'");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"struct S { float x; };\n"
+		"void main() { S s = S(1.0); result = vec4(s.y); }", "no field 'y'");
+	expect_err(CSPV_STAGE_FRAGMENT, "float g = someFunc();\nvoid main() { }", "constant expression");
+	expect_err(CSPV_STAGE_FRAGMENT, "const float g;\nvoid main() { }", "requires an initializer");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float a[2][2];"), "multi-dimensional");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float a[0];"), "must be positive");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float a[2] = float[](1.0, 2.0, 3.0);"), "cannot convert");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(1); float f = v.length();"), ".length() requires an array");
+}
+
+static void test_ssbo(void)
+{
+	// The CF draw-shader payload idiom: readonly SSBO with a runtime vec4 array.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"layout(std430, set = 2, binding = 1) readonly buffer payload_buffer { vec4 payload[]; };\n"
+		"void main() {\n"
+		"	vec4 acc = vec4(0);\n"
+		"	for (int i = 0; i < payload.length(); ++i) acc += payload[i];\n"
+		"	result = acc;\n"
+		"}\n");
+	// SSBO in a vertex shader with scalar members + runtime tail, dynamic index.
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(std430, set = 0, binding = 0) readonly buffer data_buffer {\n"
+		"	int u_count;\n"
+		"	vec2 u_scale;\n"
+		"	float values[];\n"
+		"};\n"
+		"void main() {\n"
+		"	float v = u_count > 0 ? values[u_count - 1] : 0.0;\n"
+		"	gl_Position = vec4(u_scale * v, 0, 1);\n"
+		"}\n");
+	// Writable SSBO.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) out vec4 result;\n"
+		"layout(std430, set = 2, binding = 0) buffer out_buffer { uint counts[]; };\n"
+		"void main() { counts[0] = 5u; result = vec4(1); }\n");
+	// Errors.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(std430, set = 0, binding = 0) readonly buffer b { vec4 data[]; int after; };\n"
+		"void main() { }", "must be the last member");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 0, binding = 0) uniform u { vec4 data[]; };\n"
+		"void main() { }", "only allowed in buffer blocks");
+	// OpArrayLength on a runtime array member.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(std430, set = 0, binding = 0) readonly buffer b { vec4 data[]; };\n"
+		"layout(location = 0) out vec4 result;\n"
+		"void main() { result = vec4(float(data.length())); }");
+	// Instance-named blocks (the hrc idiom): same member name across blocks,
+	// accessed as instance.member, including runtime arrays and .length().
+	expect_ok(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) writeonly buffer OutRad { uvec2 data[]; } u_out_rad;\n"
+		"layout(std430, set = 1, binding = 1) writeonly buffer OutTrn { uvec2 data[]; } u_out_trn;\n"
+		"layout(set = 2, binding = 0) uniform Params { int u_count; float u_scale; } u_params;\n"
+		"void main() {\n"
+		"	uint i = gl_GlobalInvocationID.x;\n"
+		"	if (int(i) >= u_params.u_count || int(i) >= u_out_rad.data.length()) return;\n"
+		"	u_out_rad.data[i] = uvec2(i, uint(u_params.u_scale));\n"
+		"	u_out_trn.data[i] = u_out_rad.data[i] + uvec2(1u);\n"
+		"}\n");
+	// textureOffset with constant offsets (the shallow_water idiom).
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in vec2 uv;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D tex;\n"
+		"void main() {\n"
+		"	float ha = textureOffset(tex, uv, ivec2(-1, 1)).r;\n"
+		"	float hb = textureOffset(tex, uv, ivec2(1, 1)).r;\n"
+		"	result = vec4(ha, hb, 0, 1);\n"
+		"}\n");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in vec2 uv;\n"
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D tex;\n"
+		"void main() { ivec2 o = ivec2(1); result = textureOffset(tex, uv, o); }\n",
+		"constant");
+}
+
+static void test_compute(void)
+{
+	// Minimal compute shader with builtins and an SSBO.
+	expect_ok(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer out_buffer { float results[]; };\n"
+		"void main() {\n"
+		"	uint i = gl_GlobalInvocationID.x;\n"
+		"	uint li = gl_LocalInvocationIndex + gl_LocalInvocationID.y + gl_WorkGroupID.z + gl_NumWorkGroups.x;\n"
+		"	results[i] = float(i + li);\n"
+		"}\n");
+	// Shared memory + barrier + atomics (the prefix-scan shape).
+	expect_ok(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 256) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer data_buffer { uint data[]; };\n"
+		"shared uint temp[256];\n"
+		"shared uint total;\n"
+		"void main() {\n"
+		"	uint i = gl_LocalInvocationIndex;\n"
+		"	temp[i] = data[i];\n"
+		"	barrier();\n"
+		"	for (uint off = 1u; off < 256u; off <<= 1u) {\n"
+		"		uint v = 0u;\n"
+		"		if (i >= off) v = temp[i - off];\n"
+		"		barrier();\n"
+		"		temp[i] += v;\n"
+		"		barrier();\n"
+		"	}\n"
+		"	memoryBarrierShared();\n"
+		"	groupMemoryBarrier();\n"
+		"	memoryBarrier();\n"
+		"	memoryBarrierBuffer();\n"
+		"	atomicAdd(total, temp[i]);\n"
+		"	uint old = atomicMax(data[0], temp[i]);\n"
+		"	old += atomicMin(data[1], 4u) + atomicExchange(data[2], 7u);\n"
+		"	old += atomicCompSwap(data[3], 0u, 1u) + atomicAnd(data[4], 3u) + atomicOr(data[5], 1u) + atomicXor(data[6], 2u);\n"
+		"	data[i] = temp[i] + old;\n"
+		"}\n");
+	// Storage images: load/store/size, float + uint formats.
+	expect_ok(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 16, local_size_y = 16) in;\n"
+		"layout(set = 0, binding = 0) uniform sampler2D u_input;\n"
+		"layout(set = 1, binding = 0, rgba8) uniform writeonly image2D u_output;\n"
+		"layout(set = 1, binding = 1, rgba32f) uniform image2D u_scratch;\n"
+		"layout(set = 1, binding = 2, r32ui) uniform image2D u_flags;\n"
+		"void main() {\n"
+		"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+		"	ivec2 size = imageSize(u_scratch);\n"
+		"	if (p.x >= size.x || p.y >= size.y) return;\n"
+		"	vec4 c = texelFetch(u_input, p, 0);\n"
+		"	vec4 s = imageLoad(u_scratch, p);\n"
+		"	uvec4 f = imageLoad(u_flags, p);\n"
+		"	imageStore(u_output, p, c + s);\n"
+		"	imageStore(u_flags, p, f + uvec4(1u));\n"
+		"}\n");
+	// Errors.
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("barrier();"), "requires a compute shader");
+	expect_err(CSPV_STAGE_FRAGMENT, "shared float x;\nvoid main() { }", "require a compute shader");
+	expect_err(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 8) in;\n"
+		"layout(set = 0, binding = 0) uniform image2D img;\n"
+		"void main() { }", "requires a format");
+	expect_err(CSPV_STAGE_COMPUTE,
+		"layout(local_size_x = 8) in;\n"
+		"void main() { float x = 1.0; atomicAdd(x, 1.0); }", "int or uint");
+}
+
+static void test_reflection(void)
+{
+	// Vertex: inputs + a uniform block with std140 offsets.
+	CSPV_Result r = cspv_compile(
+		"layout(location = 0) in vec2 in_pos;\n"
+		"layout(location = 1) in vec4 in_col;\n"
+		"layout(location = 2) in ivec2 in_idx;\n"
+		"layout(set = 1, binding = 0) uniform uniform_block {\n"
+		"	float u_a;\n"
+		"	vec2 u_b;\n"
+		"	vec3 u_c;\n"
+		"	mat4 u_mvp;\n"
+		"	int u_d;\n"
+		"};\n"
+		"void main() { gl_Position = u_mvp * vec4(in_pos + u_b + vec2(in_idx), u_a + u_c.x + float(u_d), 1) * in_col; }\n",
+		CSPV_STAGE_VERTEX);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CSPV_Reflection* rf = &r.reflection;
+		CHECK(asize(rf->inputs) == 3);
+		CHECK(sequ(rf->inputs[0].name, "in_pos") && rf->inputs[0].location == 0 && rf->inputs[0].type == CSPV_TYPE_FLOAT2);
+		CHECK(sequ(rf->inputs[1].name, "in_col") && rf->inputs[1].location == 1 && rf->inputs[1].type == CSPV_TYPE_FLOAT4);
+		CHECK(sequ(rf->inputs[2].name, "in_idx") && rf->inputs[2].location == 2 && rf->inputs[2].type == CSPV_TYPE_SINT2);
+		CHECK(asize(rf->uniform_blocks) == 1);
+		CSPV_ReflectionBlock* b = &rf->uniform_blocks[0];
+		CHECK(sequ(b->name, "uniform_block") && b->set == 1 && b->binding == 0);
+		CHECK(b->num_members == 5 && b->first_member == 0);
+		CSPV_ReflectionMember* m = rf->uniform_members;
+		CHECK(sequ(m[0].name, "u_a") && m[0].type == CSPV_TYPE_FLOAT && m[0].offset == 0);
+		CHECK(sequ(m[1].name, "u_b") && m[1].type == CSPV_TYPE_FLOAT2 && m[1].offset == 8);
+		CHECK(sequ(m[2].name, "u_c") && m[2].type == CSPV_TYPE_FLOAT3 && m[2].offset == 16);
+		CHECK(sequ(m[3].name, "u_mvp") && m[3].type == CSPV_TYPE_MAT4 && m[3].offset == 32);
+		CHECK(sequ(m[4].name, "u_d") && m[4].type == CSPV_TYPE_SINT && m[4].offset == 96);
+		CHECK(b->size == 112); // 96 + 4 rounded up to 16.
+	}
+	cspv_free(&r);
+
+	// Fragment: samplers + SSBO. Compute: storage images.
+	r = cspv_compile(
+		"layout(location = 0) out vec4 result;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D u_image;\n"
+		"layout(set = 2, binding = 1) uniform sampler2D u_lut;\n"
+		"layout(std430, set = 2, binding = 2) readonly buffer payload_buffer { vec4 payload[]; };\n"
+		"void main() { result = texture(u_image, payload[0].xy) + texture(u_lut, vec2(0.5)); }\n",
+		CSPV_STAGE_FRAGMENT);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CSPV_Reflection* rf = &r.reflection;
+		CHECK(asize(rf->samplers) == 2);
+		CHECK(sequ(rf->samplers[0].name, "u_image") && rf->samplers[0].set == 2 && rf->samplers[0].binding == 0);
+		CHECK(sequ(rf->samplers[1].name, "u_lut") && rf->samplers[1].binding == 1);
+		CHECK(asize(rf->storage_buffers) == 1);
+		CHECK(sequ(rf->storage_buffers[0].name, "payload_buffer") && rf->storage_buffers[0].readonly);
+		CHECK(asize(rf->uniform_blocks) == 0);
+		CHECK(asize(rf->inputs) == 0); // Inputs are reflected for the vertex stage only.
+	}
+	cspv_free(&r);
+
+	r = cspv_compile(
+		"layout(local_size_x = 8) in;\n"
+		"layout(set = 1, binding = 0, rgba8) uniform writeonly image2D u_out;\n"
+		"layout(set = 0, binding = 0, rgba32f) uniform readonly image2D u_in;\n"
+		"layout(std430, set = 1, binding = 1) buffer counts_buffer { uint counts[]; };\n"
+		"void main() { imageStore(u_out, ivec2(0), imageLoad(u_in, ivec2(0))); counts[0] = 1u; }\n",
+		CSPV_STAGE_COMPUTE);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CSPV_Reflection* rf = &r.reflection;
+		CHECK(asize(rf->storage_images) == 2);
+		CHECK(sequ(rf->storage_images[0].name, "u_out") && !rf->storage_images[0].readonly);
+		CHECK(sequ(rf->storage_images[1].name, "u_in") && rf->storage_images[1].readonly);
+		CHECK(asize(rf->storage_buffers) == 1 && !rf->storage_buffers[0].readonly);
+	}
+	cspv_free(&r);
+}
+
+static void test_short_circuit(void)
+{
+	// Only the taken side of && / || / ?: evaluates. Division guards are the
+	// classic pattern that breaks under eager evaluation at runtime; here we just
+	// verify the compiled control flow validates (branches, not LogicalAnd).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float d = 0.0;\n"
+		"bool safe = d != 0.0 && (1.0 / d) > 2.0;\n"
+		"bool other = d == 0.0 || (1.0 / d) > 2.0;\n"
+		"float v = d != 0.0 ? 1.0 / d : 0.0;\n"
+		"result = vec4(safe || other ? v : 0.0);"));
+	// Ternary arms with side effects: exactly one runs.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float x = 0.0;\n"
+		"float y = true ? (x += 1.0) : (x += 2.0);\n"
+		"result = vec4(x, y, 0, 1);"));
+	// Type unification still works across arms (int literal vs float).
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN(
+		"float f = true ? 1 : 2.5;\n"
+		"vec3 v = false ? vec3(1) : vec3(0.5);\n"
+		"result = vec4(v, f);"));
+}
+
+//--------------------------------------------------------------------------------------------------
+// Fuzz smoke: mutate real shader sources and require the compiler to error
+// gracefully or succeed -- never crash. Deterministic (fixed seed) so failures
+// reproduce; a crash here shows up as a crashed test process.
+
+static uint32_t g_fuzz_state = 0x12345678u;
+static uint32_t fuzz_rand(void)
+{
+	uint32_t x = g_fuzz_state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	return g_fuzz_state = x;
+}
+
+static void test_fuzz_smoke(void)
+{
+	const char* seeds[] = { s_draw_fs, s_inst_vs, s_tile_fs, s_blit_fs, s_gamma, s_blend, s_distance };
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.include_resolve = corpus_resolve;
+
+	int compiles = 0;
+	for (int iter = 0; iter < 500; ++iter) {
+		const char* seed = seeds[fuzz_rand() % (sizeof(seeds) / sizeof(seeds[0]))];
+		char* src = smake(seed);
+		int len = (int)slen(src);
+		if (len == 0) { sfree(src); continue; }
+		// Apply 1-8 random single-byte mutations (printable ASCII + newline).
+		int mutations = 1 + (int)(fuzz_rand() % 8);
+		for (int m = 0; m < mutations; ++m) {
+			int at = (int)(fuzz_rand() % (uint32_t)len);
+			uint32_t r = fuzz_rand() % 100;
+			if (r < 70) src[at] = (char)(32 + fuzz_rand() % 95);
+			else if (r < 85) src[at] = '\n';
+			else src[at] = (char)(fuzz_rand() % 256); // Occasionally arbitrary bytes.
+		}
+		CSPV_Result r = cspv_compile_ex(src, (CSPV_Stage)(fuzz_rand() % 2), &opts);
+		if (r.success) ++compiles;
+		cspv_free(&r);
+		sfree(src);
+	}
+	CHECK(true); // Reaching here without crashing is the assertion.
+	printf("fuzz smoke: 500 mutated compiles survived (%d still compiled successfully)\n", compiles);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Error tests.
+
+static void test_errors_syntax(void)
+{
+	expect_err(CSPV_STAGE_FRAGMENT, "void main() {", "unexpected end of file");
+	expect_err(CSPV_STAGE_FRAGMENT, "void main() { float x = ; }", "unexpected token");
+	expect_err(CSPV_STAGE_FRAGMENT, "garbage;", "unexpected token at global scope");
+	expect_err(CSPV_STAGE_FRAGMENT, "void main() { float x = 1.0 }", "expected ';'");
+}
+
+static void test_sampler_dims(void)
+{
+	// Cube, 3D, and array samplers take vec3 coords and yield vec4.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = texture(s, vec3(0, 1, 0)) + textureLod(s, vec3(1, 0, 0), 2.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler3D s;\n"
+		FS_MAIN("result = texture(s, vec3(0.5));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+		FS_MAIN("result = texture(s, vec3(0.5, 0.5, 3.0));"));
+
+	// Shadow sampling yields a scalar visibility factor, in fragment (implicit lod)
+	// and vertex (lowered to explicit lod 0) stages alike.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DShadow s;\n"
+		FS_MAIN("float vis = texture(s, vec3(0.5, 0.5, 0.7)); result = vec4(vis);"));
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform sampler2DShadow s;\n"
+		"void main() { float vis = texture(s, vec3(0.5, 0.5, 0.7)); gl_Position = vec4(vis); }");
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DShadow s;\n"
+		FS_MAIN("result = vec4(textureLod(s, vec3(0.5, 0.5, 0.7), 0.0));"));
+
+	// Cube shadows take a vec4 (direction + reference) and yield a scalar; textureLod has
+	// no such GLSL overload and stays rejected.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCubeShadow s;\n"
+		FS_MAIN("float vis = texture(s, vec4(0.0, 1.0, 0.0, 0.6)); result = vec4(vis);"));
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform samplerCubeShadow s;\n"
+		"void main() { gl_Position = vec4(texture(s, vec4(1.0, 0.0, 0.0, 0.5))); }");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCubeShadow s;\n"
+		FS_MAIN("result = vec4(textureLod(s, vec4(0.0, 1.0, 0.0, 0.6), 0.0));"), "samplerCubeShadow");
+
+	// 2D array shadows take a vec4 (uv + layer + reference) and yield a scalar -- the
+	// hardware-PCF cascaded-shadow-map sampler. Vertex-stage use lowers to explicit
+	// lod 0 like the other shadow dims; textureLod has no GLSL overload.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArrayShadow s;\n"
+		FS_MAIN("float vis = texture(s, vec4(0.5, 0.5, 2.0, 0.7)); result = vec4(vis);"));
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform sampler2DArrayShadow s;\n"
+		"void main() { gl_Position = vec4(texture(s, vec4(0.5, 0.5, 1.0, 0.6))); }");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArrayShadow s;\n"
+		FS_MAIN("result = vec4(textureLod(s, vec4(0.5, 0.5, 1.0, 0.6), 0.0));"), "sampler2DArrayShadow");
+
+	// Coordinate types are enforced per dim.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = texture(s, vec2(0));"), "vec3");
+
+	// textureGrad: caller-supplied gradients drive mip selection, so it is legal in every
+	// stage. Gradients are vec2 for 2D/array/2D-shadow (the layer takes no derivative) and
+	// vec3 for cube/3D; the wide shadow dims stay rejected like textureLod.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(location = 0) in vec2 uv;\n"
+		"layout(set = 2, binding = 0) uniform sampler2D s;\n"
+		FS_MAIN("result = textureGrad(s, uv, dFdx(uv), dFdy(uv));"));
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform sampler2D s;\n"
+		"void main() { gl_Position = textureGrad(s, vec2(0.5), vec2(0.01, 0.0), vec2(0.0, 0.01)); }");
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = textureGrad(s, vec3(0, 1, 0), vec3(0.01), vec3(0.01));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler3D s;\n"
+		FS_MAIN("result = textureGrad(s, vec3(0.5), vec3(0.01), vec3(0.01));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+		FS_MAIN("result = textureGrad(s, vec3(0.5, 0.5, 3.0), vec2(0.01), vec2(0.01));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DShadow s;\n"
+		FS_MAIN("result = vec4(textureGrad(s, vec3(0.5, 0.5, 0.7), vec2(0.01), vec2(0.01)));"));
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform sampler2DShadow s;\n"
+		"void main() { gl_Position = vec4(textureGrad(s, vec3(0.5, 0.5, 0.7), vec2(0.01), vec2(0.01))); }");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = textureGrad(s, vec3(0, 1, 0), vec2(0.01), vec2(0.01));"), "vec3");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2D s;\n"
+		FS_MAIN("result = textureGrad(s, vec2(0.5), vec2(0.01));"), "expects 4 argument");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCubeShadow s;\n"
+		FS_MAIN("result = vec4(textureGrad(s, vec4(0.0, 1.0, 0.0, 0.6), vec3(0.01), vec3(0.01)));"), "samplerCubeShadow");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArrayShadow s;\n"
+		FS_MAIN("result = vec4(textureGrad(s, vec4(0.5, 0.5, 1.0, 0.6), vec2(0.01), vec2(0.01)));"), "sampler2DArrayShadow");
+
+	// textureSize works on every dim: ivec2 for 2D/cube, ivec3 for array/3D.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+		FS_MAIN("ivec3 sz = textureSize(s, 0); result = vec4(float(sz.x), float(sz.y), float(sz.z), 1.0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("ivec2 sz = textureSize(s, 0); result = vec4(float(sz.x));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler3D s;\n"
+		FS_MAIN("ivec3 sz = textureSize(s, 0); result = vec4(float(sz.z));"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArrayShadow s;\n"
+		FS_MAIN("ivec3 sz = textureSize(s, 0); result = vec4(float(sz.z));"));
+
+	// texelFetch takes ivec3 coords on array/3D samplers.
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+		FS_MAIN("result = texelFetch(s, ivec3(1, 2, 0), 0);"));
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler3D s;\n"
+		FS_MAIN("result = texelFetch(s, ivec3(1, 2, 3), 0);"));
+
+	// textureOffset extends to arrays (the offset applies to uv, not the layer).
+	expect_ok(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+		FS_MAIN("result = textureOffset(s, vec3(0.5, 0.5, 1.0), ivec2(1, -1));"));
+
+	// GLSL defines no texelFetch for samplerCube or shadow samplers, and no
+	// textureOffset for cubes.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = texelFetch(s, ivec2(0), 0);"), "no texelFetch for samplerCube");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform sampler2DShadow s;\n"
+		FS_MAIN("result = texelFetch(s, ivec2(0), 0);"), "no texelFetch for sampler2DShadow");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+		FS_MAIN("result = textureOffset(s, vec3(0, 1, 0), ivec2(1));"), "sampler2D or sampler2DArray");
+}
+
+static void test_errors_semantic(void)
+{
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("x = 1.0;"), "undeclared identifier 'x'");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec3(1);"), "cannot convert");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 1.0; vec2 v = vec2(1); v = x + v.xyx;"), "cannot convert");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("1.0 = 2.0;"), "not assignable");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(1); float f = v.z;"), "out of range");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(1); float f = v.q;"), "out of range");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 v = vec2(1); float f = v.hello;"), "invalid swizzle");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 1.0; float x = 2.0;"), "redefinition of 'x'");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("vec2 a = vec2(1); vec2 b = vec2(2); bool c = a < b;"), "scalar operands");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = 1.0 & 2.0;"), "integer operands");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("result = bad(1.0);"), "unknown function 'bad'");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(texture(1.0, vec2(0)));"), "sampler type");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("float x = clamp(1.0);"), "expects 3 argument");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(1, 2, 3, 4, 5);"), "components");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(vec2(1));"), "cannot construct");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("break;"), "break outside of a loop");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("continue;"), "continue outside of a loop");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("if (1.0) { }"), "must be bool");
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("return 1.0;"), "void function cannot return a value");
+}
+
+static void test_errors_stage_and_globals(void)
+{
+	expect_err(CSPV_STAGE_VERTEX, "void main() { discard; }", "only valid in fragment");
+	expect_err(CSPV_STAGE_FRAGMENT, "in vec2 uv;\nvoid main() { }", "layout(location");
+	expect_err(CSPV_STAGE_FRAGMENT, "uniform sampler2D s;\nvoid main() { }", "layout(set");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"uniform uniform_block { float x; };\nvoid main() { }", "layout(set");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"layout(set = 0, binding = 0) uniform uniform_block { };\nvoid main() { }", "empty");
+	expect_err(CSPV_STAGE_FRAGMENT, "layout(set = 0, binding = 0) uniform float u_x;\nvoid main() { }", "uniform block");
+	expect_err(CSPV_STAGE_FRAGMENT, "void main(float x) { }", "main must be 'void main()'");
+	expect_err(CSPV_STAGE_FRAGMENT, "float main() { return 1.0; }", "main must be 'void main()'");
+	expect_err(CSPV_STAGE_FRAGMENT, "layout(location = 0) out vec4 result;\nvoid render() { result = vec4(1); }", "no 'void main()'");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"float f(float x) { return x; }\nfloat f(float y) { return y; }\nvoid main() { }", "redefinition of 'f'");
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"float f(float x) { }\nvoid main() { }", "missing a return");
+	expect_err(CSPV_STAGE_COMPUTE, "void main() { }", "must declare layout(local_size");
+	// Matrix + and - decompose into per-column vector ops; anything else stays an error.
+	expect_ok(CSPV_STAGE_FRAGMENT, FS_MAIN("mat2 m = mat2(1); mat2 n = m + m; mat4 o = mat4(2) - mat4(1); result = vec4(n[0], o[0].xy);"));
+	expect_err(CSPV_STAGE_FRAGMENT, FS_MAIN("mat2 m = mat2(1); mat2 n = m / m;"), "matrix operands");
+	expect_err(CSPV_STAGE_FRAGMENT, "layout(location = 0) out vec4 result;\nvoid main() { result.x = gl_Position.x; }", "undeclared identifier 'gl_Position'");
+}
+
+static void test_errors_recursion(void)
+{
+	// GLSL forbids recursion; declare-before-use makes self reference an unknown symbol.
+	expect_err(CSPV_STAGE_FRAGMENT,
+		"float f(float x) { return f(x - 1.0); }\nvoid main() { }", "unknown function 'f'");
+}
+
+//--------------------------------------------------------------------------------------------------
+// Transpiler emitter tests — assert on the emitted HLSL/MSL text, since dialect
+// restrictions (FXC instruction sets, MSL sampling rules) aren't visible in SPIR-V.
+
+static CSPV_Result s_emit_all(CSPV_Stage stage, const char* src)
+{
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.emit_hlsl = true;
+	opts.emit_msl = true;
+	CSPV_Result r = cspv_compile_ex(src, stage, &opts);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CHECK(r.hlsl != NULL);
+		CHECK(r.msl != NULL);
+	}
+	return r;
+}
+
+static void test_sampler_dims_emitters(void)
+{
+	// Every emitter must speak the new sampler dims: correct texture object types in
+	// HLSL/MSL, comparison sampling for shadow, and native GLSL types for ES.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+			FS_MAIN("result = texture(s, vec3(0, 1, 0));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "TextureCube<float4>") != NULL);
+			CHECK(strstr(r.msl, "texturecube<float>") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform samplerCubeShadow s;\n"
+			FS_MAIN("result = vec4(texture(s, vec4(0.0, 1.0, 0.0, 0.6)));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "TextureCube<float4>") != NULL);
+			CHECK(strstr(r.hlsl, "SamplerComparisonState") != NULL);
+			CHECK(strstr(r.hlsl, "SampleCmpLevelZero") != NULL);
+			CHECK(strstr(r.hlsl, ").xyz, (") != NULL); // vec4 splits as xyz + w.
+			CHECK(strstr(r.msl, "depthcube<float>") != NULL);
+			CHECK(strstr(r.msl, "sample_compare") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform sampler2DArray s;\n"
+			FS_MAIN("result = texture(s, vec3(0.5, 0.5, 3.0));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "Texture2DArray<float4>") != NULL);
+			CHECK(strstr(r.msl, "texture2d_array<float>") != NULL);
+			CHECK(strstr(r.msl, "uint(rint(") != NULL); // Layer index splits out in MSL.
+		}
+		cspv_free(&r);
+	}
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform sampler2DShadow s;\n"
+			FS_MAIN("result = vec4(texture(s, vec3(0.5, 0.5, 0.7)));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "SamplerComparisonState") != NULL);
+			CHECK(strstr(r.hlsl, ".SampleCmpLevelZero(") != NULL);
+			CHECK(strstr(r.msl, "depth2d<float>") != NULL);
+			CHECK(strstr(r.msl, ".sample_compare(") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		// 2D array shadows: HLSL comparison-samples the Texture2DArray with the
+		// float3(uv, layer) location + reference; MSL splits the layer out of P.z
+		// for depth2d_array::sample_compare.
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform sampler2DArrayShadow s;\n"
+			FS_MAIN("result = vec4(texture(s, vec4(0.5, 0.5, 2.0, 0.7)));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "Texture2DArray<float4>") != NULL);
+			CHECK(strstr(r.hlsl, "SamplerComparisonState") != NULL);
+			CHECK(strstr(r.hlsl, ".SampleCmpLevelZero(") != NULL);
+			CHECK(strstr(r.hlsl, ").xyz, (") != NULL); // vec4 splits as xyz + w.
+			CHECK(strstr(r.msl, "depth2d_array<float>") != NULL);
+			CHECK(strstr(r.msl, ".sample_compare(") != NULL);
+			CHECK(strstr(r.msl, "uint(rint(") != NULL); // Layer splits out in MSL.
+		}
+		cspv_free(&r);
+	}
+	{
+		// textureSize/texelFetch on array and cube dims lower per backend: HLSL
+		// GetDimensions helpers with the right arity, MSL read/get_* methods.
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform sampler2DArray s_arr;\n"
+			"layout(set = 2, binding = 1) uniform samplerCube s_cube;\n"
+			FS_MAIN(
+			"ivec3 a = textureSize(s_arr, 0);\n"
+			"ivec2 c = textureSize(s_cube, 0);\n"
+			"vec4 t = texelFetch(s_arr, ivec3(1, 2, 0), 0);\n"
+			"result = t + vec4(float(a.z), float(c.x), 0.0, 1.0);"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "cf_texsize(s_arr_tex, ") != NULL);
+			CHECK(strstr(r.hlsl, "cf_texsize(s_cube_tex, ") != NULL);
+			CHECK(strstr(r.hlsl, "s_arr_tex.Load(int4(") != NULL);
+			CHECK(strstr(r.msl, "get_array_size()") != NULL);
+			CHECK(strstr(r.msl, "s_arr_tex.read(uint2((") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		// ES 3.00 output keeps the native GLSL types and generic texture() calls.
+		CSPV_Options opts;
+		memset(&opts, 0, sizeof(opts));
+		opts.emit_glsl300 = true;
+		CSPV_Result r = cspv_compile_ex(
+			"layout(set = 2, binding = 0) uniform samplerCube s;\n"
+			"layout(set = 2, binding = 1) uniform sampler2DShadow sh;\n"
+			"layout(set = 2, binding = 2) uniform sampler2DArrayShadow csm;\n"
+			"layout(set = 3, binding = 0) uniform uniform_block { vec4 u_dir; };\n"
+			FS_MAIN("result = texture(s, u_dir.xyz) + vec4(texture(sh, vec3(0.5, 0.5, 0.7))) + vec4(texture(csm, vec4(0.5, 0.5, 1.0, 0.7)));"),
+			CSPV_STAGE_FRAGMENT, &opts);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			CHECK(r.glsl300 != NULL);
+			if (r.glsl300) {
+				CHECK(strstr(r.glsl300, "samplerCube") != NULL);
+				CHECK(strstr(r.glsl300, "sampler2DShadow") != NULL);
+				CHECK(strstr(r.glsl300, "sampler2DArrayShadow") != NULL);
+				// ES block names carry the stage so vs and fs can both declare
+				// uniform_block in one linked program.
+				CHECK(strstr(r.glsl300, "cf_fs_uniform_block") != NULL);
+			}
+		}
+		cspv_free(&r);
+	}
+	{
+		// Vertex-stage shadow sampling must still lower to an explicit level.
+		CSPV_Result r = s_emit_all(CSPV_STAGE_VERTEX,
+			"layout(set = 1, binding = 0) uniform sampler2DShadow s;\n"
+			"void main() { gl_Position = vec4(texture(s, vec3(0.5, 0.5, 0.7))); }\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, ".SampleCmpLevelZero(") != NULL);
+			CHECK(strstr(r.msl, ".sample_compare(") != NULL);
+			CHECK(strstr(r.msl, "level(0)") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		// textureGrad: HLSL SampleGrad everywhere; MSL spells the gradient option per
+		// texture shape and splits the array layer out; ES 3.00 keeps the native call.
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(location = 0) in vec2 uv;\n"
+			"layout(set = 2, binding = 0) uniform sampler2D s2;\n"
+			"layout(set = 2, binding = 1) uniform samplerCube sc;\n"
+			"layout(set = 2, binding = 2) uniform sampler3D s3;\n"
+			"layout(set = 2, binding = 3) uniform sampler2DArray sa;\n"
+			"layout(set = 2, binding = 4) uniform sampler2DShadow sh;\n"
+			FS_MAIN("result = textureGrad(s2, uv, dFdx(uv), dFdy(uv))"
+			        " + textureGrad(sc, vec3(0, 1, 0), vec3(0.01), vec3(0.01))"
+			        " + textureGrad(s3, vec3(0.5), vec3(0.01), vec3(0.01))"
+			        " + textureGrad(sa, vec3(uv, 2.0), vec2(0.01), vec2(0.01))"
+			        " + vec4(textureGrad(sh, vec3(uv, 0.7), vec2(0.01), vec2(0.01)));"));
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "s2_tex.SampleGrad(s2_smp, ") != NULL);
+			CHECK(strstr(r.hlsl, "sc_tex.SampleGrad(sc_smp, ") != NULL);
+			CHECK(strstr(r.hlsl, "s3_tex.SampleGrad(s3_smp, ") != NULL);
+			CHECK(strstr(r.hlsl, "sa_tex.SampleGrad(sa_smp, ") != NULL);
+			CHECK(strstr(r.hlsl, "sh_tex.SampleCmpLevelZero(") != NULL);
+			CHECK(strstr(r.msl, "s2_tex.sample(s2_smp, uv, gradient2d(") != NULL);
+			CHECK(strstr(r.msl, "gradientcube(") != NULL);
+			CHECK(strstr(r.msl, "gradient3d(") != NULL);
+			CHECK(strstr(r.msl, "sa_tex.sample(sa_smp, (") != NULL);
+			CHECK(strstr(r.msl, ").z)), gradient2d(") != NULL);
+			CHECK(strstr(r.msl, "sh_tex.sample_compare(") != NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		// Explicit gradients need nothing from the stage: vertex output uses them as-is
+		// rather than lowering to level 0.
+		CSPV_Result r = s_emit_all(CSPV_STAGE_VERTEX,
+			"layout(set = 1, binding = 0) uniform sampler2D s;\n"
+			"void main() { gl_Position = textureGrad(s, vec2(0.5), vec2(0.01, 0.0), vec2(0.0, 0.01)); }\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "s_tex.SampleGrad(s_smp, ") != NULL);
+			CHECK(strstr(r.hlsl, "SampleLevel") == NULL);
+			CHECK(strstr(r.msl, "gradient2d(") != NULL);
+			CHECK(strstr(r.msl, "level(0)") == NULL);
+		}
+		cspv_free(&r);
+	}
+	{
+		CSPV_Options opts;
+		memset(&opts, 0, sizeof(opts));
+		opts.emit_glsl300 = true;
+		CSPV_Result r = cspv_compile_ex(
+			"layout(location = 0) in vec2 uv;\n"
+			"layout(set = 2, binding = 0) uniform sampler2D s;\n"
+			FS_MAIN("result = textureGrad(s, uv, dFdx(uv), dFdy(uv));"),
+			CSPV_STAGE_FRAGMENT, &opts);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success && r.glsl300) CHECK(strstr(r.glsl300, "textureGrad(") != NULL);
+		cspv_free(&r);
+	}
+}
+
+
+
+// Sized arrays in uniform blocks: the skinning-palette case. mat4/vec4 elements, std140
+// strides, dynamic indexing, correct reflection, and native declarations from every emitter.
+static void test_block_arrays(void)
+{
+	// Dynamic indexing of a mat4 palette, plus a vec4 table -- the SPIR-V must validate.
+	// Skinning blends transformed positions rather than matrices (matrix addition is not
+	// in the language, and the blended-position form is cheaper anyway).
+	expect_ok(CSPV_STAGE_VERTEX,
+		"layout(location = 0) in vec3 in_pos;\n"
+		"layout(location = 1) in vec2 in_joints;\n"
+		"layout(location = 2) in vec2 in_weights;\n"
+		"layout(set = 1, binding = 0) uniform uniform_block {\n"
+		"	mat4 u_vp;\n"
+		"	mat4 u_bones[6];\n"
+		"	vec4 u_tints[3];\n"
+		"};\n"
+		"void main() {\n"
+		"	vec4 p = vec4(in_pos, 1.0);\n"
+		"	vec4 skinned = u_bones[int(in_joints.x)] * p * in_weights.x + u_bones[int(in_joints.y)] * p * in_weights.y;\n"
+		"	gl_Position = u_vp * skinned + u_tints[2] + u_tints[int(in_joints.x)];\n"
+		"}\n");
+
+	// Reflection: array members report their element type, array_length, and std140
+	// offsets (mat4[6] strides 64; vec4[3] strides 16), and the block size includes them.
+	{
+		CSPV_Result r = cspv_compile(
+			"layout(set = 1, binding = 0) uniform uniform_block {\n"
+			"	mat4 u_vp;\n"
+			"	mat4 u_bones[6];\n"
+			"	vec4 u_tints[3];\n"
+			"	float u_tail;\n"
+			"};\n"
+			"void main() { gl_Position = u_vp * u_bones[1] * (u_tints[0] + vec4(u_tail)); }\n",
+			CSPV_STAGE_VERTEX);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			CSPV_Reflection* rf = &r.reflection;
+			CHECK(asize(rf->uniform_blocks) == 1);
+			CSPV_ReflectionMember* m = rf->uniform_members;
+			CHECK(sequ(m[0].name, "u_vp") && m[0].type == CSPV_TYPE_MAT4 && m[0].offset == 0 && m[0].array_length == 1);
+			CHECK(sequ(m[1].name, "u_bones") && m[1].type == CSPV_TYPE_MAT4 && m[1].offset == 64 && m[1].array_length == 6);
+			CHECK(sequ(m[2].name, "u_tints") && m[2].type == CSPV_TYPE_FLOAT4 && m[2].offset == 448 && m[2].array_length == 3);
+			CHECK(sequ(m[3].name, "u_tail") && m[3].offset == 496);
+			CHECK(rf->uniform_blocks[0].size == 512); // 496 + 4 rounded up to 16.
+		}
+		cspv_free(&r);
+	}
+
+	// The element restriction is enforced: everything std140 would pad gets rejected
+	// with a pointer at the fix.
+	expect_err(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform uniform_block { float u_w[4]; };\n"
+		"void main() { gl_Position = vec4(u_w[0]); }\n", "vec4");
+	expect_err(CSPV_STAGE_VERTEX,
+		"layout(set = 1, binding = 0) uniform uniform_block { vec3 u_v[4]; };\n"
+		"void main() { gl_Position = vec4(u_v[0], 1.0); }\n", "vec4");
+}
+
+static void test_block_arrays_emitters(void)
+{
+	// TEMP: dump the kelp VS transpiled to ES300.
+	{
+		CSPV_Options od; memset(&od, 0, sizeof(od));
+		od.emit_glsl300 = true;
+		CSPV_Result rd = cspv_compile_ex(
+		"layout (location = 0) in vec3 in_pos;\n"
+		"layout (location = 1) in vec3 in_normal;\n"
+		"layout (location = 2) in vec2 in_joints;\n"
+		"layout (location = 3) in vec2 in_weights;\n"
+		"layout (location = 8)  in vec4 in_model0;\n"
+		"layout (location = 9)  in vec4 in_model1;\n"
+		"layout (location = 10) in vec4 in_model2;\n"
+		"layout (location = 15) in vec4 in_mesh_attributes;\n"
+		"layout (location = 0) out vec3 v_normal;\n"
+		"layout (location = 1) out vec4 v_attrs;\n"
+		"layout (location = 2) out float v_height;\n"
+		"layout (set = 1, binding = 0) uniform uniform_block {\n"
+		"    mat4 u_view_projection;\n"
+		"    mat4 u_bones[6];\n"
+		"};\n"
+		"void main() {\n"
+		"    vec4 p0 = vec4(in_pos, 1.0);\n"
+		"    vec4 n0 = vec4(in_normal, 0.0);\n"
+		"    vec3 pos = (u_bones[int(in_joints.x)] * p0 * in_weights.x + u_bones[int(in_joints.y)] * p0 * in_weights.y).xyz;\n"
+		"    vec3 nrm = normalize((u_bones[int(in_joints.x)] * n0 * in_weights.x + u_bones[int(in_joints.y)] * n0 * in_weights.y).xyz);\n"
+		"    vec4 p = vec4(pos, 1.0);\n"
+		"    vec3 world = vec3(dot(in_model0, p), dot(in_model1, p), dot(in_model2, p));\n"
+		"    v_normal = normalize(vec3(dot(in_model0.xyz, nrm), dot(in_model1.xyz, nrm), dot(in_model2.xyz, nrm)));\n"
+		"    v_attrs = in_mesh_attributes;\n"
+		"    v_height = in_pos.y / 2.6;\n"
+		"    gl_Position = u_view_projection * vec4(world, 1.0);\n"
+		"}\n"
+		, CSPV_STAGE_VERTEX, &od);
+		if (rd.success) { puts("==== ES300 ===="); puts(rd.glsl300); puts("==== END ===="); }
+		else puts(rd.error_message);
+		cspv_free(&rd);
+	}
+	// Every backend declares the array natively and indexes it dynamically. ES output is
+	// requested explicitly -- s_emit_all covers HLSL/MSL only.
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.emit_glsl300 = true;
+	opts.emit_hlsl = true;
+	opts.emit_msl = true;
+	CSPV_Result r = cspv_compile_ex(
+		"layout(location = 0) in vec3 in_pos;\n"
+		"layout(location = 1) in vec2 in_joints;\n"
+		"layout(set = 1, binding = 0) uniform uniform_block {\n"
+		"	mat4 u_vp;\n"
+		"	mat4 u_bones[6];\n"
+		"	vec4 u_tints[3];\n"
+		"};\n"
+		"void main() { gl_Position = u_vp * u_bones[int(in_joints.x)] * vec4(in_pos, 1.0) + u_tints[1]; }\n",
+		CSPV_STAGE_VERTEX, &opts);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CHECK(r.glsl300 && strstr(r.glsl300, "u_bones[6]") != NULL);
+		CHECK(r.glsl300 && strstr(r.glsl300, "u_tints[3]") != NULL);
+		CHECK(r.hlsl && strstr(r.hlsl, "u_bones[6]") != NULL);
+		CHECK(r.hlsl && strstr(r.hlsl, "column_major") != NULL);
+		// mat4[6] lands at std140 offset 64 = register c4; vec4[3] at 448 = c28.
+		CHECK(r.hlsl && strstr(r.hlsl, "packoffset(c4)") != NULL);
+		CHECK(r.hlsl && strstr(r.hlsl, "packoffset(c28)") != NULL);
+		CHECK(r.msl && strstr(r.msl, "u_bones[6]") != NULL);
+		CHECK(r.msl && strstr(r.msl, "u_tints[3]") != NULL);
+	}
+	cspv_free(&r);
+
+	// GLSL ES 3.00 emulates readonly SSBOs as RGBA32UI texture fetches: the block
+	// disappears, a stage-pooled usampler2D takes its place (names match the CF GLES
+	// backend's binding contract), float payloads bit-cast through uintBitsToFloat,
+	// and shapes outside CF's documented storage pattern get teaching errors.
+	{
+		CSPV_Options o;
+		memset(&o, 0, sizeof(o));
+		o.emit_glsl300 = true;
+		CSPV_Result rv = cspv_compile_ex(
+			"layout(location = 0) in vec3 in_pos;\n"
+			"layout(std430, set = 0, binding = 0) readonly buffer bones_buffer { vec4 u_bones[]; };\n"
+			"layout(set = 1, binding = 0) uniform uniform_block { mat4 u_vp; };\n"
+			"void main() { gl_Position = u_vp * vec4(in_pos, 1.0) + u_bones[gl_InstanceIndex]; }\n",
+			CSPV_STAGE_VERTEX, &o);
+		CHECK_MSG(rv.success, rv.error_message);
+		if (rv.success) {
+			CHECK(rv.glsl300 && strstr(rv.glsl300, "uniform highp usampler2D u_vs_storage_0;") != NULL);
+			CHECK(rv.glsl300 && strstr(rv.glsl300, "uintBitsToFloat(texelFetch(u_vs_storage_0, cf_storage_coord(int(gl_InstanceID)), 0))") != NULL);
+		}
+		cspv_free(&rv);
+		// Fragment stage names the fs pool; uvec4 tails fetch raw, no bit-cast.
+		CSPV_Result rf = cspv_compile_ex(
+			"layout(location = 0) out vec4 result;\n"
+			"layout(std430, set = 2, binding = 0) readonly buffer data_buffer { uvec4 u_data[]; };\n"
+			"void main() { result = vec4(u_data[0]); }\n",
+			CSPV_STAGE_FRAGMENT, &o);
+		CHECK_MSG(rf.success, rf.error_message);
+		if (rf.success) {
+			CHECK(rf.glsl300 && strstr(rf.glsl300, "u_fs_storage_0") != NULL);
+			CHECK(rf.glsl300 && strstr(rf.glsl300, "uintBitsToFloat") == NULL);
+		}
+		cspv_free(&rf);
+		// Outside the emulatable pattern: scalar tails and .length() get clear errors.
+		expect_err_ex(CSPV_STAGE_VERTEX,
+			"layout(location = 0) in vec3 in_pos;\n"
+			"layout(std430, set = 0, binding = 0) readonly buffer b { float u_f[]; };\n"
+			"void main() { gl_Position = vec4(u_f[0]); }\n",
+			"vec4 or uvec4", &o);
+		// A local or parameter shadowing the member name is NOT a storage access;
+		// the validation walk must not reject its bare (un-indexed) uses.
+		{
+			CSPV_Result rs = cspv_compile_ex(
+				"layout(location = 0) in vec3 in_pos;\n"
+				"layout(std430, set = 0, binding = 0) readonly buffer bones_buffer { vec4 u_bones[]; };\n"
+				"float scale(float u_bones) { return u_bones * 2.0; }\n"
+				"void main() {\n"
+				"	float u_local = scale(0.5);\n"
+				"	gl_Position = u_bones[0] * u_local;\n"
+				"}\n",
+				CSPV_STAGE_VERTEX, &o);
+			CHECK_MSG(rs.success, rs.error_message);
+			cspv_free(&rs);
+		}
+		// Writes through the emulation get a clear readonly error, not a baffling
+		// driver complaint about assigning to a texelFetch.
+		expect_err_ex(CSPV_STAGE_VERTEX,
+			"layout(location = 0) in vec3 in_pos;\n"
+			"layout(std430, set = 0, binding = 0) readonly buffer b { vec4 u_v[]; };\n"
+			"void main() { u_v[0] = vec4(1.0); gl_Position = vec4(0.0); }\n",
+			"readonly in GLSL ES", &o);
+		expect_err_ex(CSPV_STAGE_VERTEX,
+			"layout(location = 0) in vec3 in_pos;\n"
+			"layout(std430, set = 0, binding = 0) readonly buffer b { vec4 u_v[]; };\n"
+			"void main() { gl_Position = u_v.length() > 0 ? u_v[0] : vec4(0.0); }\n",
+			".length()", &o);
+	}
+}
+
+static void test_emitters(void)
+{
+	// Implicit-lod sampling is fragment-only: FXC rejects Sample() in vs/cs
+	// profiles (X4532), and MSL requires an explicit lod outside fragment
+	// functions. Vertex texture fetch (the galaxy idiom) must lower to lod 0.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_VERTEX,
+			"layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+			"layout(location = 0) in vec2 in_uv;\n"
+			"void main() { gl_Position = texture(u_tex, in_uv); }\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, ".SampleLevel(") != NULL);
+			CHECK(strstr(r.hlsl, ".Sample(") == NULL);
+			CHECK(strstr(r.msl, "level(0)") != NULL);
+		}
+		cspv_free(&r);
+	}
+	// Compute sampling lowers the same way, and instance-named buffer blocks
+	// (the hrc idiom) mangle to a flat <instance>_<member> resource.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_COMPUTE,
+			"layout(local_size_x = 64) in;\n"
+			"layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+			"layout(std430, set = 1, binding = 0) buffer Out { vec4 data[]; } u_out;\n"
+			"void main() {\n"
+			"	uint i = gl_GlobalInvocationID.x;\n"
+			"	u_out.data[i] = texture(u_tex, vec2(0.5));\n"
+			"}\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, ".SampleLevel(") != NULL);
+			CHECK(strstr(r.msl, "level(0)") != NULL);
+			CHECK(strstr(r.hlsl, "u_out_data") != NULL);
+			CHECK(strstr(r.msl, "u_out_data") != NULL);
+		}
+		cspv_free(&r);
+	}
+	// Fragment sampling keeps implicit gradients.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"layout(set = 2, binding = 0) uniform sampler2D u_tex;\n"
+			"layout(location = 0) in vec2 uv;\n"
+			"layout(location = 0) out vec4 result;\n"
+			"void main() { result = texture(u_tex, uv); }\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, ".Sample(") != NULL);
+			CHECK(strstr(r.hlsl, ".SampleLevel(") == NULL);
+			CHECK(strstr(r.msl, "level(0)") == NULL);
+		}
+		cspv_free(&r);
+	}
+	// Struct constructors print as cf_make_<name> factories (neither HLSL nor
+	// MSL has struct constructor syntax).
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"struct Interval { float lo; float hi; };\n"
+			"layout(location = 0) out vec4 result;\n"
+			"void main() { Interval iv = Interval(0.0, 1.0); result = vec4(iv.lo, iv.hi, 0, 1); }\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "cf_make_Interval(") != NULL);
+			CHECK(strstr(r.msl, "cf_make_Interval(") != NULL);
+		}
+		cspv_free(&r);
+	}
+	// MSL emits shader functions as cf_shader member functions. Without a
+	// `thread` address-space qualifier they compile as address-space-generic,
+	// so passing a member array (a GLSL global) to a `thread T*` array
+	// parameter is rejected by Metal ("cannot initialize a parameter of type
+	// 'thread float2 *' with an lvalue of type '__metal_generic float2[8]'"
+	// -- the builtin draw shader's distance_polygon idiom). HLSL has no
+	// address spaces and must stay unqualified.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"vec2 pts[8];\n"
+			"layout(location = 0) out vec4 result;\n"
+			"float poly(vec2 p, vec2 v[8], int n) { return v[0].x + p.x + float(n); }\n"
+			"void main() {\n"
+			"	pts[0] = vec2(1.0);\n"
+			"	result = vec4(poly(gl_FragCoord.xy, pts, 8));\n"
+			"}\n");
+		if (r.success) {
+			CHECK(strstr(r.msl, "thread float2* v, int n) thread\n") != NULL);
+			CHECK(strstr(r.msl, "cf_main_() thread\n") != NULL);
+			CHECK(strstr(r.hlsl, ") thread") == NULL);
+		}
+		cspv_free(&r);
+	}
+	// Struct-typed ternaries lower to cf_select_<name> in HLSL (FXC's ?: only
+	// accepts numeric operands, error X3020); MSL keeps the plain ternary.
+	{
+		CSPV_Result r = s_emit_all(CSPV_STAGE_FRAGMENT,
+			"struct Interval { float lo; float hi; };\n"
+			"layout(location = 0) out vec4 result;\n"
+			"void main() {\n"
+			"	bool c = gl_FragCoord.x > 0.5;\n"
+			"	Interval iv = c ? Interval(0.0, 1.0) : Interval(2.0, 3.0);\n"
+			"	result = vec4(iv.lo, iv.hi, 0, 1);\n"
+			"}\n");
+		if (r.success) {
+			CHECK(strstr(r.hlsl, "cf_select_Interval(") != NULL);
+			CHECK(strstr(r.msl, "cf_select_Interval(") == NULL);
+		}
+		cspv_free(&r);
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Compute shaders on GLES3: the capture-pass fragment shader. Every produced ES source is checked
+// with glslangValidator when it is available (CSPV_GLSLANG, else $VULKAN_SDK/Bin, else PATH).
+// CSPV_ES_DUMP=<dir> writes each compute capture shader there as <name>.frag; CSPV_EXTRA_HRC_DIR
+// names another directory of hrc_*.c_shd copies (a game's) to hold to the same expectations.
+
+static bool g_has_glslang = false;
+static char* g_glslang_path; // ckit strings.
+static char* g_temp_frag;
+
+static void detect_glslang(void)
+{
+	const char* env = getenv("CSPV_GLSLANG");
+	const char* sdk = getenv("VULKAN_SDK");
+	if (env) g_glslang_path = smake(env);
+	else if (sdk) g_glslang_path = sfmake("%s\\Bin\\glslangValidator.exe", sdk);
+	else g_glslang_path = smake("glslangValidator");
+	char* cmd = sfmake("\"\"%s\" --version > nul 2>&1\"", g_glslang_path);
+	g_has_glslang = system(cmd) == 0;
+	sfree(cmd);
+	if (!g_has_glslang) printf("WARNING: glslangValidator not found (set CSPV_GLSLANG); skipping ES validation.\n");
+	const char* tmp = getenv("TEMP");
+	g_temp_frag = sfmake("%s\\cute_spirv_test_es.frag", tmp ? tmp : ".");
+}
+
+static bool validate_es_frag(const char* src)
+{
+	if (!g_has_glslang) return true;
+	FILE* f = fopen(g_temp_frag, "wb");
+	if (!f) return false;
+	fwrite(src, 1, strlen(src), f);
+	fclose(f);
+	char* cmd = sfmake("\"\"%s\" -S frag \"%s\"\"", g_glslang_path, g_temp_frag);
+	bool ok = system(cmd) == 0;
+	sfree(cmd);
+	if (!ok) printf("--- glslangValidator rejected: ---\n%s\n", src);
+	return ok;
+}
+
+static char* read_text_file(const char* path)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f) return NULL;
+	fseek(f, 0, SEEK_END);
+	long n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char* s = (char*)malloc((size_t)n + 1);
+	size_t got = fread(s, 1, (size_t)n, f);
+	s[got] = 0;
+	fclose(f);
+	return s;
+}
+
+static CSPV_Result s_compile_es(CSPV_Stage stage, const char* src)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_glsl300 = true;
+	CSPV_Result r = cspv_compile_ex(src, stage, &o);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CHECK(r.glsl300 != NULL);
+		if (r.glsl300) CHECK(validate_es_frag(r.glsl300));
+	}
+	return r;
+}
+
+static void expect_es_err(const char* src, const char* expect_substr)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_glsl300 = true;
+	expect_err_ex(CSPV_STAGE_COMPUTE, src, expect_substr, &o);
+}
+
+typedef struct cs_site_expect
+{
+	CSPV_WriteKind kind;
+	const char* name;
+	int rank;
+	int words;
+	CSPV_WriteType type;
+} cs_site_expect;
+
+typedef struct cs_shader_expect
+{
+	const char* file;
+	int k;
+	cs_site_expect sites[3];
+	const char* loaded[3];
+} cs_shader_expect;
+
+// Each HRC shader, with its write sites in source order.
+static const cs_shader_expect s_hrc_expect[] = {
+	{ "hrc_display.c_shd", 2, { { CSPV_WRITE_IMAGE, "u_fluence_lin", 1, 4, CSPV_WRITE_FLOAT }, { CSPV_WRITE_IMAGE, "u_fluence", 0, 4, CSPV_WRITE_FLOAT } }, { 0 } },
+	{ "hrc_extend.c_shd", 1, { { CSPV_WRITE_BUFFER, "u_out_t", 1, 4, CSPV_WRITE_UINT } }, { 0 } },
+	{ "hrc_feedback.c_shd", 1, { { CSPV_WRITE_IMAGE, "u_emissivity", 0, 4, CSPV_WRITE_FLOAT } }, { "u_diffuse", "u_fluence_lin", "u_emissivity" } },
+	{ "hrc_finish.c_shd", 3, { { CSPV_WRITE_IMAGE, "u_a0", 0, 4, CSPV_WRITE_FLOAT }, { CSPV_WRITE_IMAGE, "u_a1", 1, 4, CSPV_WRITE_FLOAT }, { CSPV_WRITE_IMAGE, "u_b1", 2, 4, CSPV_WRITE_FLOAT } }, { "u_a0", "u_a1", "u_b1" } },
+	{ "hrc_merge.c_shd", 1, { { CSPV_WRITE_BUFFER, "u_rc_rad", 3, 2, CSPV_WRITE_UINT } }, { 0 } },
+	{ "hrc_trace.c_shd", 1, { { CSPV_WRITE_BUFFER, "u_out_t", 0, 4, CSPV_WRITE_UINT } }, { 0 } },
+	{ "hrc_far.c_shd", 2, { { CSPV_WRITE_IMAGE, "u_ring", 0, 4, CSPV_WRITE_FLOAT }, { CSPV_WRITE_IMAGE, "u_ring", 0, 4, CSPV_WRITE_FLOAT } }, { 0 } },
+};
+
+static void dump_es(const char* file, const char* src)
+{
+	const char* dir = getenv("CSPV_ES_DUMP");
+	if (!dir) return;
+	char* path = sfmake("%s\\%s", dir, file);
+	char* dot = strstr(path, ".c_shd");
+	if (dot) strcpy(dot, ".frag");
+	FILE* f = fopen(path, "wb");
+	if (f) {
+		fwrite(src, 1, strlen(src), f);
+		fclose(f);
+	}
+	sfree(path);
+}
+
+static void check_hrc_dir(const char* dir, bool required)
+{
+	for (int i = 0; i < (int)(sizeof(s_hrc_expect) / sizeof(s_hrc_expect[0])); i++) {
+		const cs_shader_expect* x = s_hrc_expect + i;
+		char* path = sfmake("%s/%s", dir, x->file);
+		char* src = read_text_file(path);
+		if (!src) {
+			// hrc_far exists only in the game's copy.
+			if (required && strcmp(x->file, "hrc_far.c_shd")) CHECK_MSG(false, path);
+			sfree(path);
+			continue;
+		}
+		CSPV_Result r = s_compile_es(CSPV_STAGE_COMPUTE, src);
+		if (r.success) {
+			dump_es(x->file, r.glsl300);
+			CSPV_WriteSite* ws = r.reflection.write_sites;
+			CHECK_MSG((int)asize(ws) == x->k, path);
+			for (int k = 0; k < x->k && k < (int)asize(ws); k++) {
+				CHECK_MSG(ws[k].kind == x->sites[k].kind, path);
+				CHECK_MSG(!strcmp(ws[k].name, x->sites[k].name), path);
+				CHECK_MSG(ws[k].rank == x->sites[k].rank, path);
+				CHECK_MSG(ws[k].words == x->sites[k].words, path);
+				CHECK_MSG(ws[k].type == x->sites[k].type, path);
+				if (ws[k].kind == CSPV_WRITE_IMAGE) CHECK_MSG(ws[k].set == 1, path);
+				char* gate = sfmake("if (u_cspv_site == %d)", k);
+				CHECK_MSG(strstr(r.glsl300, gate) != NULL, path);
+				sfree(gate);
+			}
+			for (int j = 0; j < 3 && x->loaded[j]; j++) {
+				bool found = false;
+				for (int m = 0; m < (int)asize(r.reflection.loaded_images); m++) {
+					if (!strcmp(r.reflection.loaded_images[m], x->loaded[j])) found = true;
+				}
+				CHECK_MSG(found, x->loaded[j]);
+				char* decl = sfmake("uniform highp sampler2D %s;", x->loaded[j]);
+				CHECK_MSG(strstr(r.glsl300, decl) != NULL, path);
+				sfree(decl);
+			}
+			// Write-only images are never declared.
+			if (!x->loaded[0]) CHECK_MSG(asize(r.reflection.loaded_images) == 0, path);
+			CHECK(strstr(r.glsl300, "void cspv_main_()") != NULL);
+			CHECK(strstr(r.glsl300, "imageStore") == NULL);
+			CHECK(strstr(r.glsl300, "image2D") == NULL);
+		}
+		cspv_free(&r);
+		free(src);
+		sfree(path);
+	}
+}
+
+static void test_compute_es(void)
+{
+	// The HRC shaders: CF's sample copies always, a game's copies when named.
+	{
+		char* dir = smake(__FILE__);
+		char* cut = strstr(dir, "cute_spirv_test.c");
+		if (cut) *cut = 0;
+		char* hrc = sfmake("%s../samples/hrc_gi_data", dir);
+		check_hrc_dir(hrc, true);
+		sfree(hrc);
+		const char* extra = getenv("CSPV_EXTRA_HRC_DIR");
+		if (extra) check_hrc_dir(extra, false);
+		// The old HRC's composite tiles through shared memory: outside the class.
+		char* comp_path = sfmake("%s../samples/hrc_data/hrc_composite.c_shd", dir);
+		char* comp = read_text_file(comp_path);
+		CHECK_MSG(comp != NULL, comp_path);
+		if (comp) expect_es_err(comp, "compute shaders using 'shared' cannot run on GLES3 (line ");
+		free(comp);
+		sfree(comp_path);
+		sfree(dir);
+	}
+
+	// Prologue conventions and builtins.
+	{
+		CSPV_Result r = s_compile_es(CSPV_STAGE_COMPUTE,
+			"layout(local_size_x = 8, local_size_y = 4) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Out { uvec4 data[]; };\n"
+			"void main() {\n"
+			"	uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 64u;\n"
+			"	data[i] = uvec4(gl_WorkGroupID.x, gl_LocalInvocationID.y, gl_LocalInvocationIndex, gl_NumWorkGroups.z);\n"
+			"}\n");
+		if (r.success) {
+			const char* s = r.glsl300;
+			CHECK(strstr(s, "#version 300 es\n") == s);
+			CHECK(strstr(s, "uniform int u_cspv_site;") != NULL);
+			CHECK(strstr(s, "uniform ivec3 u_cspv_groups;") != NULL);
+			CHECK(strstr(s, "uniform int u_cspv_grid_w;") != NULL);
+			CHECK(strstr(s, "layout(location = 0) out highp uvec4 cspv_value;") != NULL);
+			CHECK(strstr(s, "layout(location = 1) out highp ivec4 cspv_target;") != NULL);
+			CHECK(strstr(s, "ivec3 cspv_ls = ivec3(8, 4, 1);") != NULL);
+			CHECK(strstr(s, "uniform highp usampler2D u_cs_storage_0;") != NULL);
+			CHECK(strstr(s, "gl_GlobalInvocationID") == NULL);
+			CHECK(strstr(s, "cspv_value = cspv_b;") != NULL);
+			CHECK(asize(r.reflection.write_sites) == 1);
+			CHECK(r.reflection.local_size[0] == 8 && r.reflection.local_size[1] == 4);
+		}
+		cspv_free(&r);
+	}
+
+	// Struct reads, member writes at static offsets, compound assignment, ++, uint images.
+	{
+		CSPV_Result r = s_compile_es(CSPV_STAGE_COMPUTE,
+			"layout(local_size_x = 64) in;\n"
+			"struct Prim { vec4 p; vec2 q; float s; int t; vec3 n; };\n"
+			"struct Pair { vec2 a; uvec2 b; };\n"
+			"layout(std430, set = 0, binding = 3) readonly buffer Prims { Prim data[]; } u_prims;\n"
+			"layout(std430, set = 1, binding = 0) buffer Pairs { Pair data[]; } u_pairs;\n"
+			"layout(std430, set = 1, binding = 1) buffer Floats { float data[]; } u_f;\n"
+			"layout(set = 1, binding = 2, r32ui) uniform image2D u_flags;\n"
+			"void main() {\n"
+			"	int i = int(gl_GlobalInvocationID.x);\n"
+			"	Prim p = u_prims.data[i];\n"
+			"	u_pairs.data[i].a = p.q;\n"
+			"	u_pairs.data[i].b.y = uint(p.t);\n"
+			"	u_f.data[i] += p.s + p.n.z;\n"
+			"	u_f.data[i + 1]++;\n"
+			"	u_pairs.data[i + 2] = Pair(vec2(1.0), uvec2(2u));\n"
+			"	uvec4 f = imageLoad(u_flags, ivec2(i, 0));\n"
+			"	imageStore(u_flags, ivec2(i, 0), f + uvec4(1u));\n"
+			"}\n");
+		if (r.success) {
+			const char* s = r.glsl300;
+			CSPV_WriteSite* ws = r.reflection.write_sites;
+			CHECK(asize(ws) == 6);
+			if (asize(ws) == 6) {
+				CHECK(ws[0].kind == CSPV_WRITE_BUFFER && ws[0].words == 2 && ws[0].rank == 1 && ws[0].set == 1 && ws[0].binding == 0);
+				CHECK(ws[1].words == 1 && ws[1].rank == 1);
+				CHECK(ws[2].words == 1 && ws[2].rank == 2 && !strcmp(ws[2].name, "u_f"));
+				CHECK(ws[3].words == 1);
+				CHECK(ws[4].words == 4);
+				CHECK(ws[5].kind == CSPV_WRITE_IMAGE && ws[5].type == CSPV_WRITE_UINT && ws[5].image_format == 33);
+			}
+			// Prim: p@0 q@4 s@6 t@7 n@8 (vec3 aligned to 16 bytes), stride 12 words.
+			CHECK(strstr(s, "Prim cspv_ld_0(int i) { int w = i * 12; return Prim(") != NULL);
+			CHECK(strstr(s, "cspv_texel(u_cs_storage_0, (w + 8) >> 2).xyz") != NULL);
+			CHECK(strstr(s, "int(cspv_word(u_cs_storage_0, w + 7))") != NULL);
+			CHECK(strstr(s, "int cspv_w = int(i) * 4 + 3;") != NULL);
+			CHECK(strstr(s, "uniform highp usampler2D u_flags;") != NULL);
+			CHECK(strstr(s, "texelFetch(u_flags, ivec2(i, 0), 0)") != NULL);
+		}
+		cspv_free(&r);
+	}
+
+	// An early-return write (the hrc_far shape) and a write under a switch are fine.
+	{
+		CSPV_Result r = s_compile_es(CSPV_STAGE_COMPUTE,
+			"layout(local_size_x = 64) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Out { vec2 data[]; };\n"
+			"layout(set = 2, binding = 0) uniform Params { int u_mode; };\n"
+			"void main() {\n"
+			"	int i = int(gl_GlobalInvocationID.x);\n"
+			"	if (i == 0) { data[0] = vec2(0.0); return; }\n"
+			"	switch (u_mode) { case 1: data[i].y = 1.0; break; default: break; }\n"
+			"}\n");
+		if (r.success) {
+			CHECK(asize(r.reflection.write_sites) == 2);
+			CHECK(strstr(r.glsl300, "uniform cf_fs_Params") != NULL);
+		}
+		cspv_free(&r);
+	}
+
+	// Outside the class: each feature named, with its line.
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"shared vec4 tile[64];\n"
+		"void main() { }\n",
+		"compute shaders using 'shared' cannot run on GLES3 (line 2)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() {\n"
+		"	barrier();\n"
+		"}\n",
+		"compute shaders using 'barrier' cannot run on GLES3 (line 4)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() { memoryBarrierBuffer(); }\n",
+		"'memoryBarrierBuffer' cannot run on GLES3");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() {\n"
+		"	atomicAdd(data[0], 1u);\n"
+		"}\n",
+		"compute shaders using 'atomicAdd' cannot run on GLES3 (line 4)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() {\n"
+		"	for (int j = 0; j < 4; j++) {\n"
+		"		data[j] = 1u;\n"
+		"	}\n"
+		"}\n",
+		"a storage write inside a loop cannot run on GLES3 (line 5)");
+	expect_es_err(
+		"layout(local_size_x = 8, local_size_y = 8) in;\n"
+		"layout(set = 1, binding = 0, rgba16f) uniform image2D u_img;\n"
+		"void main() {\n"
+		"	int j = 0;\n"
+		"	while (j < 2) { imageStore(u_img, ivec2(j, 0), vec4(1.0)); j++; }\n"
+		"}\n",
+		"inside a loop cannot run on GLES3 (line 5)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"struct S { vec3 n; float w; };\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { S data[]; };\n"
+		"void main() {\n"
+		"	data[0].n = vec3(1.0);\n"
+		"}\n",
+		"writing a vec3 to a storage buffer cannot run on GLES3 (line 5)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"struct Big { vec4 a; vec4 b; };\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { Big data[]; };\n"
+		"void main() {\n"
+		"	data[0] = Big(vec4(0.0), vec4(1.0));\n"
+		"}\n",
+		"write the struct's members one by one");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { vec4 data[]; };\n"
+		"void main() { data[0].xy = vec2(1.0); }\n",
+		"multi-component swizzle");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void put(uint i) { data[i] = i; }\n"
+		"void main() { put(0u); }\n",
+		"outside main() cannot run on GLES3 (line 3)");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() { uint x = (data[0] = 1u); }\n",
+		"inside an expression cannot run on GLES3");
+	expect_es_err(
+		"layout(local_size_x = 64) in;\n"
+		"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+		"void main() { data[0] = uint(data.length()); }\n",
+		"'.length()' on a storage buffer cannot run on GLES3");
+
+	// Vertex/fragment storage emulation is unchanged by the compute path.
+	{
+		CSPV_Result r = s_compile_es(CSPV_STAGE_FRAGMENT,
+			"layout(location = 0) out vec4 result;\n"
+			"layout(std430, set = 2, binding = 0) readonly buffer data_buffer { vec4 u_data[]; };\n"
+			"void main() { result = u_data[1]; }\n");
+		if (r.success) {
+			CHECK(strstr(r.glsl300, "u_fs_storage_0") != NULL);
+			CHECK(strstr(r.glsl300, "cspv_") == NULL);
+			CHECK(asize(r.reflection.write_sites) == 0);
+		}
+		cspv_free(&r);
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+// Fragment depth output.
+
+// Scans a module for one instruction whose operand words (after the result/target id) start with
+// the given values.
+static bool spirv_has(const uint32_t* words, size_t count, int opcode, uint32_t a, uint32_t b)
+{
+	size_t i = 5;
+	while (i < count) {
+		uint32_t n = words[i] >> 16;
+		if (!n) return false;
+		if ((int)(words[i] & 0xFFFF) == opcode && n >= 4 && words[i + 2] == a && words[i + 3] == b) return true;
+		if ((int)(words[i] & 0xFFFF) == opcode && n == 3 && words[i + 2] == a && b == 0) return true;
+		i += n;
+	}
+	return false;
+}
+
+#define SPV_OP_EXECUTION_MODE 16
+#define SPV_OP_DECORATE 71
+#define SPV_DECORATION_BUILTIN 11
+#define SPV_BUILTIN_FRAG_DEPTH 22
+#define SPV_EXECUTION_MODE_DEPTH_REPLACING 12
+
+static CSPV_Result s_emit_every_target(CSPV_Stage stage, const char* src)
+{
+	CSPV_Options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.emit_glsl300 = true;
+	opts.emit_hlsl = true;
+	opts.emit_msl = true;
+	opts.emit_wgsl = true;
+	CSPV_Result r = cspv_compile_ex(src, stage, &opts);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		CHECK(validate_spirv(r.spirv, r.word_count));
+		CHECK(r.glsl300 && r.hlsl && r.msl && r.wgsl);
+		if (r.wgsl) CHECK(validate_wgsl(r.wgsl));
+	}
+	return r;
+}
+
+static void test_frag_depth(void)
+{
+	// The first reference sits inside a helper's branch; main must still see the same output
+	// after the helper's scope has closed.
+	{
+		CSPV_Result r = s_emit_every_target(CSPV_STAGE_FRAGMENT,
+			"layout(location = 0) in vec2 uv;\n"
+			"layout(location = 0) out vec4 result;\n"
+			"void write_depth(float d)\n"
+			"{\n"
+			"	if (d > 0.5) gl_FragDepth = d;\n"
+			"	else gl_FragDepth = 1.0 - d;\n"
+			"}\n"
+			"void main()\n"
+			"{\n"
+			"	write_depth(uv.x);\n"
+			"	gl_FragDepth += 0.125;\n"
+			"	result = vec4(gl_FragDepth);\n"
+			"}\n");
+		if (r.success) {
+			CHECK(spirv_has(r.spirv, r.word_count, SPV_OP_DECORATE, SPV_DECORATION_BUILTIN, SPV_BUILTIN_FRAG_DEPTH));
+			CHECK(spirv_has(r.spirv, r.word_count, SPV_OP_EXECUTION_MODE, SPV_EXECUTION_MODE_DEPTH_REPLACING, 0));
+			CHECK(strstr(r.hlsl, "SV_Depth") != NULL);
+			CHECK(strstr(r.msl, "[[depth(any)]]") != NULL);
+			CHECK(strstr(r.glsl300, "gl_FragDepth") != NULL);
+			CHECK(validate_es_frag(r.glsl300));
+			CHECK(strstr(r.wgsl, "@builtin(frag_depth)") != NULL);
+		}
+		cspv_free(&r);
+	}
+	// A shader that never touches depth gets no depth output on any target.
+	{
+		CSPV_Result r = s_emit_every_target(CSPV_STAGE_FRAGMENT, FS_MAIN("result = vec4(gl_FragCoord.z);"));
+		if (r.success) {
+			CHECK(!spirv_has(r.spirv, r.word_count, SPV_OP_DECORATE, SPV_DECORATION_BUILTIN, SPV_BUILTIN_FRAG_DEPTH));
+			CHECK(!spirv_has(r.spirv, r.word_count, SPV_OP_EXECUTION_MODE, SPV_EXECUTION_MODE_DEPTH_REPLACING, 0));
+			CHECK(strstr(r.hlsl, "Depth") == NULL);
+			CHECK(strstr(r.msl, "depth(") == NULL);
+			CHECK(strstr(r.glsl300, "gl_FragDepth") == NULL);
+			CHECK(strstr(r.wgsl, "frag_depth") == NULL);
+		}
+		cspv_free(&r);
+	}
+	// Depth is a fragment output only.
+	expect_err(CSPV_STAGE_VERTEX, "void main() { gl_FragDepth = 0.5; gl_Position = vec4(0); }\n", "undeclared identifier 'gl_FragDepth'");
+}
+
+//--------------------------------------------------------------------------------------------------
+// WGSL: the shader corpus (builtins, every sample shader, CSPV_EXTRA_SHADER_DIR) through naga,
+// and the binding contract the WebGPU backend relies on.
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
+
+// Recursively collect files under `dir` ending in one of the shader extensions.
+static void list_shader_files(const char* dir, CK_DYNA char*** out)
+{
+	static const char* exts[] = { ".shd", ".c_shd", ".vs", ".fs" };
+#ifdef _WIN32
+	char* pattern = sfmake("%s/*", dir);
+	struct _finddata_t fd;
+	intptr_t h = _findfirst(pattern, &fd);
+	sfree(pattern);
+	if (h == -1) return;
+	do {
+		const char* name = fd.name;
+		bool is_dir = (fd.attrib & _A_SUBDIR) != 0;
+#else
+	DIR* d = opendir(dir);
+	if (!d) return;
+	struct dirent* ent;
+	while ((ent = readdir(d))) {
+		const char* name = ent->d_name;
+		char* full_stat = sfmake("%s/%s", dir, name);
+		struct stat st;
+		bool is_dir = stat(full_stat, &st) == 0 && S_ISDIR(st.st_mode);
+		sfree(full_stat);
+#endif
+		if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+		char* full = sfmake("%s/%s", dir, name);
+		if (is_dir) {
+			list_shader_files(full, out);
+			sfree(full);
+			continue;
+		}
+		bool match = false;
+		for (int i = 0; i < 4; i++) {
+			size_t n = strlen(name), e = strlen(exts[i]);
+			if (n > e && !strcmp(name + n - e, exts[i])) match = true;
+		}
+		if (match) apush(*out, full);
+		else sfree(full);
+#ifdef _WIN32
+	} while (_findnext(h, &fd) == 0);
+	_findclose(h);
+#else
+	}
+	closedir(d);
+#endif
+}
+
+static bool ends_with(const char* s, const char* suffix)
+{
+	size_t n = strlen(s), e = strlen(suffix);
+	return n >= e && !strcmp(s + n - e, suffix);
+}
+
+// Writes `wgsl` as <CSPV_WGSL_OUT>/<name> (for the WebGPU backend's hand checks).
+static void wgsl_write_out(const char* name, const char* wgsl)
+{
+	const char* dir = getenv("CSPV_WGSL_OUT");
+	if (!dir || !wgsl) return;
+	char* path = sfmake("%s/%s", dir, name);
+	FILE* f = fopen(path, "wb");
+	if (f) {
+		fwrite(wgsl, 1, strlen(wgsl), f);
+		fclose(f);
+	}
+	sfree(path);
+}
+
+static CSPV_Options wgsl_corpus_options(void)
+{
+	static CSPV_Define payload_define = { "CF_PAYLOAD_BINDING", "1" };
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.include_resolve = corpus_resolve;
+	o.num_defines = 1;
+	o.defines = &payload_define;
+	o.emit_wgsl = true;
+	return o;
+}
+
+// Compile one shader to WGSL and validate it; returns the result for further checks.
+static CSPV_Result wgsl_compile(CSPV_Stage stage, const char* src, const CSPV_Options* opts, const char* label)
+{
+	g_wgsl_label = label;
+	CSPV_Result r = cspv_compile_ex(src, stage, opts);
+	if (!r.success) {
+		if (g_has_naga) g_wgsl_stats[g_wgsl_cat].total++;
+		printf("--- WGSL compile failed (%s): %s\n", label, r.error_message);
+		CHECK_MSG(false, r.error_message);
+	} else {
+		CHECK(r.wgsl != NULL);
+		if (r.wgsl) CHECK_MSG(validate_wgsl(r.wgsl), label);
+	}
+	g_wgsl_label = NULL;
+	return r;
+}
+
+static void wgsl_corpus_dir(const char* dir, const char* out_prefix)
+{
+	CK_DYNA char** files = NULL;
+	list_shader_files(dir, &files);
+	for (int i = 0; i < (int)asize(files); i++) {
+		const char* path = files[i];
+		char* src = read_text_file(path);
+		if (!src) continue;
+		const char* base = strrchr(path, '/');
+		base = base ? base + 1 : path;
+		CSPV_Options o = wgsl_corpus_options();
+		CSPV_Result r;
+		memset(&r, 0, sizeof(r));
+		bool ran = true;
+		if (ends_with(path, ".c_shd")) {
+			r = wgsl_compile(CSPV_STAGE_COMPUTE, src, &o, path);
+		} else if (ends_with(path, ".vs")) {
+			r = wgsl_compile(CSPV_STAGE_VERTEX, src, &o, path);
+		} else if (ends_with(path, ".fs")) {
+			r = wgsl_compile(CSPV_STAGE_FRAGMENT, src, &o, path);
+		} else if (strstr(src, "vec4 shader(")) {
+			// A draw shader: spliced into the draw fragment shader, like cf_make_draw_shader.
+			o.user = src;
+			r = wgsl_compile(CSPV_STAGE_FRAGMENT, s_draw_fs, &o, path);
+		} else {
+			ran = false;
+			printf("NOTE: %s is neither a draw shader nor a known stage; skipped.\n", path);
+		}
+		// The HRC GI sample's modules go to CSPV_WGSL_OUT for the WebGPU backend's checks.
+		if (ran && r.success && out_prefix && strstr(path, "hrc_gi_data")) {
+			char* name = sfmake("%shrc_gi_%s.wgsl", out_prefix, base);
+			wgsl_write_out(name, r.wgsl);
+			sfree(name);
+		}
+		cspv_free(&r);
+		free(src);
+	}
+	for (int i = 0; i < (int)asize(files); i++) sfree(files[i]);
+	afree(files);
+}
+
+static void test_wgsl_corpus(void)
+{
+	if (!g_has_naga) return;
+
+	// Builtins, exactly as cute_graphics compiles them (no CF_GLES: WebGPU has real storage).
+	g_wgsl_cat = WGSL_BUILTIN;
+	{
+		CSPV_Options o = wgsl_corpus_options();
+		for (int i = 0; i < (int)(sizeof(s_builtin_shader_sources) / sizeof(s_builtin_shader_sources[0])); i++) {
+			const char* name = s_builtin_shader_sources[i].name;
+			char* vs_name = sfmake("builtin_%s.vs.wgsl", name);
+			char* fs_name = sfmake("builtin_%s.fs.wgsl", name);
+			CSPV_Result v = wgsl_compile(CSPV_STAGE_VERTEX, s_builtin_shader_sources[i].vertex, &o, vs_name);
+			CSPV_Result f = wgsl_compile(CSPV_STAGE_FRAGMENT, s_builtin_shader_sources[i].fragment, &o, fs_name);
+			if (v.success) wgsl_write_out(vs_name, v.wgsl);
+			if (f.success) wgsl_write_out(fs_name, f.wgsl);
+			sfree(vs_name);
+			sfree(fs_name);
+			cspv_free(&v);
+			cspv_free(&f);
+		}
+		for (int i = 0; i < (int)(sizeof(s_builtin_compute_shader_sources) / sizeof(s_builtin_compute_shader_sources[0])); i++) {
+			char* cs_name = sfmake("builtin_%s.cs.wgsl", s_builtin_compute_shader_sources[i].name);
+			CSPV_Result c = wgsl_compile(CSPV_STAGE_COMPUTE, s_builtin_compute_shader_sources[i].source, &o, cs_name);
+			if (c.success) wgsl_write_out(cs_name, c.wgsl);
+			sfree(cs_name);
+			cspv_free(&c);
+		}
+	}
+
+	// Every sample shader.
+	g_wgsl_cat = WGSL_SAMPLES;
+	{
+		char* dir = smake(__FILE__);
+		for (char* p = dir; *p; p++) if (*p == '\\') *p = '/';
+		char* cut = strstr(dir, "cute_spirv_test.c");
+		if (cut) *cut = 0;
+		char* samples = sfmake("%s../samples", dir);
+		CK_DYNA char** probe = NULL;
+		list_shader_files(samples, &probe);
+		CHECK_MSG(asize(probe) > 0, samples);
+		for (int i = 0; i < (int)asize(probe); i++) sfree(probe[i]);
+		afree(probe);
+		wgsl_corpus_dir(samples, "");
+		sfree(samples);
+		sfree(dir);
+	}
+
+	// A game's shaders (Of Eld: CSPV_EXTRA_SHADER_DIR=C:\randy\rts\assets\shaders).
+	const char* extra = getenv("CSPV_EXTRA_SHADER_DIR");
+	if (extra) {
+		g_wgsl_cat = WGSL_EXTRA;
+		wgsl_corpus_dir(extra, NULL);
+	}
+	g_wgsl_cat = WGSL_TESTS;
+}
+
+static const CSPV_WgslBinding* find_wgsl_binding(const CSPV_Result* r, const char* name, CSPV_WgslBindingKind kind)
+{
+	for (int i = 0; i < (int)asize(r->reflection.wgsl_bindings); i++) {
+		const CSPV_WgslBinding* b = r->reflection.wgsl_bindings + i;
+		if (b->kind == kind && !strcmp(b->name, name)) return b;
+	}
+	return NULL;
+}
+
+static void test_wgsl_contract(void)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_wgsl = true;
+
+	// Fragment: samplers (pairs), a storage image, buffers, uniforms -- binding numbers by class
+	// rank regardless of the GLSL binding gaps.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(location = 0) in vec2 v_uv;\n"
+			"layout(location = 1) flat in int v_id;\n"
+			"layout(location = 0) out vec4 result;\n"
+			"layout(set = 2, binding = 0) uniform sampler2D u_a;\n"
+			"layout(set = 2, binding = 1) uniform sampler2DShadow u_shadow;\n"
+			"layout(set = 2, binding = 2, rgba8) uniform readonly image2D u_img;\n"
+			"layout(std430, set = 2, binding = 3) readonly buffer B0 { vec4 data0[]; };\n"
+			"layout(std430, set = 2, binding = 4) readonly buffer B1 { uvec2 data1[]; } u_b1;\n"
+			"layout(set = 3, binding = 0) uniform U0 { vec3 u_dir; float u_k; mat4 u_m; };\n"
+			"layout(set = 3, binding = 1) uniform U1 { vec2 u_p; vec4 u_q[2]; };\n"
+			"void main() {\n"
+			"	vec4 c = texture(u_a, v_uv) * texture(u_shadow, vec3(v_uv, 0.5));\n"
+			"	c += imageLoad(u_img, ivec2(v_id, 0)) + data0[v_id] + vec4(u_b1.data1[0], 0u, 1u);\n"
+			"	result = c * u_k + vec4(u_dir, 1.0) * u_m + vec4(u_p, 0.0, 0.0) + u_q[1];\n"
+			"}\n", CSPV_STAGE_FRAGMENT, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(strstr(s, "diagnostic(off, derivative_uniformity);") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(0) var u_a: texture_2d<f32>;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(1) var cspv_smp_u_a: sampler;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(2) var u_shadow: texture_depth_2d;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(3) var cspv_smp_u_shadow: sampler_comparison;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(4) var u_img: texture_storage_2d<rgba8unorm, read>;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(5) var<storage, read> cspv_sb_B0: cspv_SB_B0;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(6) var<storage, read> u_b1: cspv_SB_B1;") != NULL);
+			CHECK(strstr(s, "@group(3) @binding(0) var<uniform> cspv_ub_U0: cspv_UB_U0;") != NULL);
+			CHECK(strstr(s, "@group(3) @binding(1) var<uniform> cspv_ub_U1: cspv_UB_U1;") != NULL);
+			CHECK(strstr(s, "@location(1) @interpolate(flat) v_id: i32,") != NULL);
+			// std140: u_q starts at 16 (vec2 then vec4 array), so u_p pads to 16.
+			CHECK(strstr(s, "@size(16) u_p: vec2f,") != NULL);
+			CHECK(asize(r.reflection.wgsl_bindings) == 9);
+			const CSPV_WgslBinding* b = find_wgsl_binding(&r, "u_shadow", CSPV_WGSL_SAMPLER);
+			CHECK(b && b->binding == 3 && b->comparison && b->slot == 1);
+			b = find_wgsl_binding(&r, "u_shadow", CSPV_WGSL_SAMPLED_TEXTURE);
+			CHECK(b && b->binding == 2 && b->sample_type == CSPV_WGSL_SAMPLE_DEPTH);
+			b = find_wgsl_binding(&r, "u_img", CSPV_WGSL_STORAGE_TEXTURE);
+			CHECK(b && b->binding == 4 && b->access == CSPV_WGSL_ACCESS_READ && b->image_format == 4);
+			b = find_wgsl_binding(&r, "B1", CSPV_WGSL_STORAGE_BUFFER);
+			CHECK(b && b->binding == 6 && b->slot == 4 && b->access == CSPV_WGSL_ACCESS_READ);
+			b = find_wgsl_binding(&r, "U1", CSPV_WGSL_UNIFORM_BUFFER);
+			CHECK(b && b->set == 3 && b->binding == 1);
+		}
+		cspv_free(&r);
+	}
+
+	// Compute: set 0 read-only, set 1 read-write, a split rgba16f image (loaded and stored),
+	// an r32ui image that stays read_write, and the split's load side after everything else.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(local_size_x = 8, local_size_y = 8) in;\n"
+			"layout(set = 0, binding = 0) uniform sampler2D u_src;\n"
+			"layout(std430, set = 0, binding = 1) readonly buffer In { vec4 inputs[]; };\n"
+			"layout(set = 1, binding = 0, rgba16f) uniform image2D u_acc;\n"
+			"layout(set = 1, binding = 1, r32ui) uniform image2D u_count;\n"
+			"layout(set = 1, binding = 2, rgba8) uniform writeonly image2D u_out;\n"
+			"layout(std430, set = 1, binding = 3) buffer Out { uint hits[]; };\n"
+			"layout(set = 2, binding = 0) uniform P { int u_n; };\n"
+			"void main() {\n"
+			"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+			"	vec4 a = imageLoad(u_acc, p) + textureLod(u_src, vec2(p) / 64.0, 0.0) + inputs[u_n];\n"
+			"	imageStore(u_acc, p, a);\n"
+			"	uvec4 c = imageLoad(u_count, p);\n"
+			"	imageStore(u_count, p, c + uvec4(1u));\n"
+			"	imageStore(u_out, p, a);\n"
+			"	atomicAdd(hits[0], 1u);\n"
+			"}\n", CSPV_STAGE_COMPUTE, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(strstr(s, "@group(0) @binding(0) var u_src: texture_2d<f32>;") != NULL);
+			CHECK(strstr(s, "@group(0) @binding(2) var<storage, read> cspv_sb_In: cspv_SB_In;") != NULL);
+			CHECK(strstr(s, "@group(1) @binding(0) var u_acc: texture_storage_2d<rgba16float, write>;") != NULL);
+			CHECK(strstr(s, "@group(1) @binding(1) var u_count: texture_storage_2d<r32uint, read_write>;") != NULL);
+			CHECK(strstr(s, "@group(1) @binding(2) var u_out: texture_storage_2d<rgba8unorm, write>;") != NULL);
+			CHECK(strstr(s, "@group(1) @binding(3) var<storage, read_write> cspv_sb_Out: cspv_SB_Out;") != NULL);
+			CHECK(strstr(s, "@group(1) @binding(4) var cspv_ld_u_acc: texture_2d<f32>;") != NULL);
+			CHECK(strstr(s, "@group(2) @binding(0) var<uniform> cspv_ub_P: cspv_UB_P;") != NULL);
+			CHECK(strstr(s, "hits: array<atomic<u32>>,") != NULL);
+			CHECK(strstr(s, "atomicAdd(&cspv_sb_Out.hits[0], 1u)") != NULL);
+			CHECK(strstr(s, "textureLoad(cspv_ld_u_acc, p, 0)") != NULL);
+			CHECK(strstr(s, "@compute @workgroup_size(8, 8, 1)") != NULL);
+			CHECK(asize(r.reflection.wgsl_splits) == 1);
+			if (asize(r.reflection.wgsl_splits) == 1) {
+				const CSPV_WgslSplit* sp = r.reflection.wgsl_splits;
+				CHECK(!strcmp(sp->name, "u_acc") && sp->set == 1 && sp->store_binding == 0 && sp->load_binding == 4);
+			}
+			const CSPV_WgslBinding* b = find_wgsl_binding(&r, "u_acc", CSPV_WGSL_SPLIT_LOAD_TEXTURE);
+			CHECK(b && b->binding == 4 && b->sample_type == CSPV_WGSL_SAMPLE_FLOAT && b->image_format == 2);
+			b = find_wgsl_binding(&r, "u_count", CSPV_WGSL_STORAGE_TEXTURE);
+			CHECK(b && b->access == CSPV_WGSL_ACCESS_READ_WRITE);
+		}
+		cspv_free(&r);
+	}
+
+	// WGSL strictness: out params through globals and swizzles, overloads, swizzle stores,
+	// fall-through switch, mod/inverse/diagonal helpers, ternaries, bvec ==, int shifts.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(location = 0) out vec4 result;\n"
+			"vec3 g_acc;\n"
+			"void split(float x, out float a, inout vec2 b) { a = x; b += vec2(x); x = 0.0; }\n"
+			"float f(float x) { return x; }\n"
+			"float f(vec2 x) { return x.y; }\n"
+			"int pick(int k) {\n"
+			"	int r = 0;\n"
+			"	switch (k) { case 0: r += 1; case 1: r += 2; break; default: r = 7; }\n"
+			"	return r;\n"
+			"}\n"
+			"void main() {\n"
+			"	vec4 v = vec4(0.0);\n"
+			"	vec2 b = vec2(1.0);\n"
+			"	split(2.0, g_acc.y, v.zw);\n"
+			"	split(3.0, v.x, b);\n"
+			"	v.xy = v.yx * 2.0;\n"
+			"	v.zw *= 0.5;\n"
+			"	mat3 m = inverse(mat3(2.0));\n"
+			"	ivec2 q = ivec2(3, 5) << 1;\n"
+			"	uint u = 7u;\n"
+			"	u >>= 1;\n"
+			"	bool same = all(equal(b, vec2(1.0)));\n"
+			"	float t = same ? f(b) : f(v.x);\n"
+			"	result = vec4(mod(v.xyz, 2.0) + g_acc + m[1] + vec3(q, pick(int(u))), t);\n"
+			"}\n", CSPV_STAGE_FRAGMENT, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(strstr(s, "fn split(cspv_p_x: f32, a: ptr<function, f32>, b: ptr<function, vec2f>)") != NULL);
+			CHECK(strstr(s, "fn f_cspv0(x: f32) -> f32") != NULL);
+			CHECK(strstr(s, "fn f_cspv1(x: vec2f) -> f32") != NULL);
+			CHECK(strstr(s, "g_acc.y = cspv_o") != NULL);
+			CHECK(strstr(s, "split(3.0, &v.x") == NULL);
+			CHECK(strstr(s, "&b)") != NULL);
+			CHECK(strstr(s, "select(") != NULL);
+			CHECK(strstr(s, "all((b == vec2f(1.0)))") != NULL);
+			CHECK(strstr(s, "fn cspv_mod3(") != NULL);
+			CHECK(strstr(s, "fn cspv_inverse3(") != NULL);
+			CHECK(strstr(s, "fn cspv_diag3(") != NULL);
+		}
+		cspv_free(&r);
+	}
+}
+
+static int count_substr(const char* s, const char* sub)
+{
+	int n = 0;
+	size_t len = strlen(sub);
+	for (const char* p = strstr(s, sub); p; p = strstr(p + len, sub)) n++;
+	return n;
+}
+
+static void test_wgsl_semantics(void)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_wgsl = true;
+
+	// ?: arms that write (directly, through a transitive user call, an atomic, or imageStore)
+	// must run only when taken: if/else into a temporary, never select(). Pure arms keep select().
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(local_size_x = 4) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Hits { uint hits[]; };\n"
+			"layout(std430, set = 1, binding = 1) buffer Out { uint data[]; };\n"
+			"layout(set = 1, binding = 2, r32ui) uniform writeonly image2D u_mark;\n"
+			"uint g_count;\n"
+			"uint bump() { g_count += 1u; return g_count; }\n"
+			"uint bump_twice() { return bump() + bump(); }\n"
+			"uint mark(ivec2 p) { imageStore(u_mark, p, uvec4(1u)); return 1u; }\n"
+			"uint pure_sq(uint x) { uint y = x; y *= x; return y; }\n"
+			"void main() {\n"
+			"	uint k = gl_GlobalInvocationID.x;\n"
+			"	uint a = k > 0u ? bump_twice() : 0u;\n"
+			"	uint b = k > 1u ? atomicAdd(hits[0], 1u) : 0u;\n"
+			"	uint c = k > 2u ? mark(ivec2(k, 0)) : 0u;\n"
+			"	uint d = k > 3u ? pure_sq(k) : 1u;\n"
+			"	data[k] = a + b + c + d;\n"
+			"}\n", CSPV_STAGE_COMPUTE, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(strstr(s, "select(0u, bump_twice()") == NULL);
+			CHECK(strstr(s, "select(0u, atomicAdd(") == NULL);
+			CHECK(strstr(s, "select(0u, mark(") == NULL);
+			CHECK(strstr(s, "select(1u, pure_sq(k), (k > 3u))") != NULL);
+			CHECK(count_substr(s, "\tif ((k > ") == 3);
+			CHECK(strstr(s, "cspv_t0 = bump_twice();") != NULL);
+		}
+		cspv_free(&r);
+	}
+
+	// A comma for-loop update runs each side exactly once per iteration, in order:
+	// distance_polygon's `j = i, i++` once ran twice, skipping every other edge.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(local_size_x = 1) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Out { int data[]; };\n"
+			"void main() {\n"
+			"	for (int i = 0, j = 3; i < 4; j = i, i++) { data[i] = j; }\n"
+			"}\n", CSPV_STAGE_COMPUTE, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(count_substr(s, "i++;") == 1);
+			CHECK(count_substr(s, "j = i;") == 1);
+			const char* copy = strstr(s, "j = i;");
+			const char* inc = strstr(s, "i++;");
+			CHECK(copy && inc && copy < inc);
+		}
+		cspv_free(&r);
+	}
+
+	// out/inout l-values are fixed at the call: an index the callee (or a later argument)
+	// changes must not move the copy-back.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(local_size_x = 1) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Out { uint data[]; };\n"
+			"uint g_i;\n"
+			"void put(out uint v) { v = 7u; g_i += 1u; }\n"
+			"void put_idx(inout uint v, inout uint i) { v += 1u; i += 1u; }\n"
+			"void main() {\n"
+			"	g_i = 0u;\n"
+			"	put(data[g_i]);\n"
+			"	uint i = 1u;\n"
+			"	put_idx(data[i], i);\n"
+			"}\n", CSPV_STAGE_COMPUTE, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(strstr(s, ".data[g_i] = cspv_o") == NULL);
+			CHECK(strstr(s, ".data[i] = cspv_o") == NULL);
+			CHECK(strstr(s, "let cspv_i") != NULL);
+		}
+		cspv_free(&r);
+	}
+
+	// atomicCompSwap is strong: atomicCompareExchangeWeak retried until it exchanges or the
+	// value it saw differs from the comparator.
+	{
+		CSPV_Result r = cspv_compile_ex(
+			"layout(local_size_x = 1) in;\n"
+			"layout(std430, set = 1, binding = 0) buffer Lock { uint lock[]; };\n"
+			"layout(std430, set = 1, binding = 1) buffer Out { uint data[]; };\n"
+			"shared int s_flag;\n"
+			"void main() {\n"
+			"	uint k = gl_GlobalInvocationID.x;\n"
+			"	uint old = atomicCompSwap(lock[k & 3u], 0u, k + 1u);\n"
+			"	int f = atomicCompSwap(s_flag, 0, 1) + 1;\n"
+			"	atomicCompSwap(lock[0], 1u, 2u);\n"
+			"	data[k] = old + uint(f);\n"
+			"}\n", CSPV_STAGE_COMPUTE, &o);
+		CHECK_MSG(r.success, r.error_message);
+		if (r.success) {
+			const char* s = r.wgsl;
+			CHECK(validate_wgsl(s));
+			CHECK(count_substr(s, "atomicCompareExchangeWeak(") == 3);
+			CHECK(count_substr(s, ".exchanged || ") == 3);
+			CHECK(strstr(s, ".old_value != ") != NULL);
+			CHECK(strstr(s, "loop\n") != NULL);
+		}
+		cspv_free(&r);
+	}
+}
+
+// A ?: arm whose call can discard runs only when taken; select() would discard every fragment.
+static void test_wgsl_discard_arm(void)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_wgsl = true;
+	CSPV_Result r = cspv_compile_ex(
+		"layout(location = 0) out vec4 result;\n"
+		"float kill_if(float x) { if (x > -1.0) discard; return x; }\n"
+		"float kill_via(float x) { return kill_if(x) + 1.0; }\n"
+		"void main() {\n"
+		"	float a = gl_FragCoord.x < -5.0 ? kill_if(gl_FragCoord.y) : 0.0;\n"
+		"	float b = gl_FragCoord.x < -6.0 ? kill_via(gl_FragCoord.y) : 0.0;\n"
+		"	result = vec4(1.0, a, b, 1.0);\n"
+		"}\n", CSPV_STAGE_FRAGMENT, &o);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		const char* s = r.wgsl;
+		CHECK(validate_wgsl(s));
+		CHECK(strstr(s, "select(0.0, kill_if(") == NULL);
+		CHECK(strstr(s, "select(0.0, kill_via(") == NULL);
+		CHECK(strstr(s, "if ((gl_FragCoord.x < -5.0))\n\t{\n\t\tcspv_t0 = kill_if(gl_FragCoord.y);") != NULL);
+		CHECK(strstr(s, "if ((gl_FragCoord.x < -6.0))\n\t{\n\t\tcspv_t1 = kill_via(gl_FragCoord.y);") != NULL);
+	}
+	cspv_free(&r);
+}
+
+// An if/else returning on both paths ends the function: a trailing return would be unreachable,
+// which Tint warns about on every page load. One falling-through path still gets the return.
+static void test_wgsl_no_dead_return(void)
+{
+	CSPV_Options o;
+	memset(&o, 0, sizeof(o));
+	o.emit_wgsl = true;
+	CSPV_Result r = cspv_compile_ex(
+		"layout(location = 0) out vec4 result;\n"
+		"float both(float x) { if (x > 0.0) { return 1.0; } else { return 2.0; } }\n"
+		"float one(float x) { if (x > 0.0) { return 1.0; } }\n"
+		"void main() { result = vec4(both(gl_FragCoord.x), one(gl_FragCoord.y), 0.0, 1.0); }\n", CSPV_STAGE_FRAGMENT, &o);
+	CHECK_MSG(r.success, r.error_message);
+	if (r.success) {
+		const char* s = r.wgsl;
+		CHECK(validate_wgsl(s));
+		const char* both = strstr(s, "fn both(");
+		const char* one = strstr(s, "fn one(");
+		CHECK(both && one);
+		if (both && one) {
+			const char* both_end = strstr(both, "\n}\n");
+			const char* one_end = strstr(one, "\n}\n");
+			const char* dead = strstr(both, "return f32();");
+			CHECK(!dead || (both_end && dead > both_end));
+			const char* kept = strstr(one, "return f32();");
+			CHECK(kept && one_end && kept < one_end);
+		}
+	}
+	cspv_free(&r);
+}
+
+int main(void)
+{
+	detect_spirv_val();
+	detect_glslang();
+	detect_naga();
+	TEST(test_wgsl_corpus);
+	TEST(test_wgsl_contract);
+	TEST(test_wgsl_semantics);
+	TEST(test_wgsl_discard_arm);
+	TEST(test_wgsl_no_dead_return);
+
+	TEST(test_preprocessor);
+	TEST(test_corpus_basic);
+	TEST(test_corpus_builtin_full);
+	TEST(test_expressions);
+	TEST(test_constructors);
+	TEST(test_intrinsics);
+	TEST(test_control_flow);
+	TEST(test_matrices);
+	TEST(test_switch_and_do);
+	TEST(test_intrinsics_extended);
+	TEST(test_structs_arrays_globals);
+	TEST(test_ssbo);
+	TEST(test_compute);
+	TEST(test_reflection);
+	TEST(test_short_circuit);
+	TEST(test_fuzz_smoke);
+	TEST(test_functions);
+	TEST(test_io_and_uniforms);
+	TEST(test_errors_syntax);
+	TEST(test_errors_semantic);
+	TEST(test_sampler_dims);
+	TEST(test_sampler_dims_emitters);
+	TEST(test_block_arrays);
+	TEST(test_block_arrays_emitters);
+	TEST(test_errors_stage_and_globals);
+	TEST(test_errors_recursion);
+	TEST(test_emitters);
+	TEST(test_compute_es);
+	TEST(test_frag_depth);
+
+	if (g_has_naga) {
+		printf("\nWGSL validated by naga:\n");
+		for (int i = 0; i < WGSL_CAT_COUNT; i++) {
+			if (g_wgsl_stats[i].total) printf("  %-30s %d/%d\n", g_wgsl_stats[i].what, g_wgsl_stats[i].valid, g_wgsl_stats[i].total);
+		}
+	}
+	map_free(g_wgsl_seen);
+	sfree(g_naga_path);
+	sfree(g_temp_wgsl);
+	sfree(g_temp_naga_log);
+	sfree(g_glslang_path);
+	sfree(g_temp_frag);
+
+	printf("\n%d checks, %d failures.\n", g_checks, g_fails);
+	return g_fails ? 1 : 0;
+}

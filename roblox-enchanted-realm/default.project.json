@@ -1,0 +1,53 @@
+{
+  "name": "EnchantedRealm",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Modules": {
+        "$className": "Folder",
+        "Config": { "$path": "src/ReplicatedStorage/Modules/Config.luau" },
+        "Regions": { "$path": "src/ReplicatedStorage/Modules/Regions.luau" },
+        "SoundIDs": { "$path": "src/ReplicatedStorage/Modules/SoundIDs.luau" }
+      }
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "Main": { "$path": "src/ServerScriptService/Main.server.luau" },
+      "Session": { "$path": "src/ServerScriptService/Session.luau" },
+      "WorldBuilder": { "$path": "src/ServerScriptService/WorldBuilder.luau" },
+      "Enemies": { "$path": "src/ServerScriptService/Enemies.luau" },
+      "Bosses": { "$path": "src/ServerScriptService/Bosses.luau" },
+      "SaveData": { "$path": "src/ServerScriptService/SaveData.luau" }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "GameClient": { "$path": "src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau" },
+        "Effects": { "$path": "src/StarterPlayer/StarterPlayerScripts/Effects.luau" },
+        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.client.luau" },
+        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.client.luau" },
+        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.client.luau" }
+      }
+    },
+    "Lighting": {
+      "$className": "Lighting",
+      "$properties": {
+        "ClockTime": 14.5,
+        "Brightness": 2.2,
+        "Ambient": [0.18, 0.22, 0.2],
+        "OutdoorAmbient": [0.25, 0.3, 0.28],
+        "FogEnd": 1200,
+        "Technology": "Future"
+      }
+    },
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": {
+        "Gravity": 150,
+        "StreamingEnabled": false
+      }
+    }
+  }
+}

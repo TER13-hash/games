@@ -1,0 +1,135 @@
+name: Documentation
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-cmake
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libcairo2-dev libfreetype6-dev libffi-dev libjpeg-dev libpng-dev libz-dev pngquant
+
+      - name: Compile docsparser
+        run: gcc tools/docs_parser.c -Ilibraries -o docsparser
+
+      - name: Generate documentation
+        run: |
+          set -o pipefail
+          ./docsparser | tee /tmp/docsparser.log
+
+      - name: Check for new undocumented references
+        run: |
+          grep '^  ' /tmp/docsparser.log | sed 's/^  //' | sort > /tmp/docs-warnings-current.txt
+          sort tools/docs_warnings_baseline.txt > /tmp/docs-warnings-baseline.txt
+          NEW=$(comm -13 /tmp/docs-warnings-baseline.txt /tmp/docs-warnings-current.txt)
+          if [ -n "$NEW" ]; then
+            echo "::error::New unresolved documentation reference(s) -- not in tools/docs_warnings_baseline.txt:"
+            echo "$NEW"
+            echo ""
+            echo "If this is a real symbol that's now documented, or the baseline needs updating for another reason,"
+            echo "regenerate tools/docs_warnings_baseline.txt from a local docsparser run."
+            exit 1
+          fi
+
+      # Shaders compile at runtime on all platforms (including web), so the web
+      # sample builds below need no precompiled shader headers.
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: "emsdk-cache"
+
+      - name: Setup CCache (emscripten)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: docs-emscripten
+
+      - name: Pre-build Emscripten ports
+        run: |
+          mkdir -p "$(em-config CACHE)/sysroot/lib/pkgconfig"
+          embuilder build sdl3
+
+      - name: Configure Emscripten build
+        run: |
+          emcmake cmake -S . -B build-emscripten -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+            -DCF_FRAMEWORK_BUILD_SAMPLES=ON \
+            -DCF_FRAMEWORK_BUILD_TESTS=OFF \
+            -DCF_BUILD_DOCSPARSER=OFF
+
+      - name: Build Emscripten samples
+        run: cmake --build build-emscripten -j
+
+      - name: Generate sample pages
+        run: |
+          ruby ./tools/generate_sample_pages.rb build-emscripten docs https://github.com/RandyGaul/cute_framework
+
+      - name: Set up Python runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+
+      - name: Install Python dependencies
+        run: pip install mkdocs mkdocs-material "mkdocs-material[imaging]" markdown-callouts
+
+      - name: Build documentation
+        run: |
+          set -o pipefail
+          mkdocs build --clean 2>&1 | tee /tmp/mkdocs-build.log
+          mkdocs --version
+          if grep -qE "contains a link '[^']*\.md'.*is not found among documentation files" /tmp/mkdocs-build.log; then
+            echo "::error::Broken internal documentation link(s) -- see warnings above."
+            exit 1
+          fi
+
+      - name: Adjust permissions
+        run: |
+          chmod -c -R +rX site/ | while read line; do
+            echo "::warning title=Invalid file permissions automatically fixed::$line"
+          done
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy documentation
+    needs: docs
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

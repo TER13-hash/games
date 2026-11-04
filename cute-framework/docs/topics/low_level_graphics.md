@@ -1,0 +1,337 @@
+# Low Level Graphics API
+
+This page talks about the low level graphics API in CF. If you want to draw shapes, text, or sprites you may instead by looking for [Drawing](drawing.md). This page covers things such as canvases, shaders, meshes, and similar. You will want to use this lower level graphics API whenever implementing custom rendering, or implementing advanced rendering techniques.
+
+## Overall Picture
+
+CF wraps [low level 3D rendering APIs](../api_reference.md#graphics). The backends supported are:
+
+- Vulkan
+- DirectX 11
+- DirectX 12
+- Metal
+- OpenGL ES
+- WebGPU (optional, see [WebGPU](webgpu.md))
+
+The major primitives that make up the graphics layer of CF are:
+
+- [`CF_Canvas`](../graphics/struct/cf_canvas.md) - A texture that can be rendered to.
+- [`CF_Texture`](../graphics/struct/cf_texture.md) - Stores image data on the GPU. Can be drawn onto the screen.
+- [`CF_Mesh`](../graphics/struct/cf_mesh.md) - Stores vertex data (triangles) for the GPU to process and draw.
+- [`CF_Shader`](../graphics/struct/cf_shader.md) - A small program on the GPU to transform a mesh's vertices into pixels on the screen.
+- [`CF_RenderState`](../graphics/struct/cf_renderstate.md) - Settings for the rendering, such as stencil or blend state options.
+- [`CF_Material`](../graphics/struct/cf_material.md) - A collection of inputs to a shader, including uniforms and textures.
+
+To draw a single frame the overall flow looks something like the following pseudocode:
+
+```
+for each canvas {
+    cf_apply_canvas(canvas);
+    for each mesh {
+        cf_mesh_update_vertex_data(mesh, ...);
+        cf_apply_mesh(mesh);
+        for each material {
+            cf_material_set_uniform_vs(material, ...);
+            cf_material_set_uniform_fs(material, ...);
+            for each shader {
+                cf_apply_shader(shader, material);
+                cf_draw_elements(...);
+            }
+        }
+    }
+}
+```
+
+The important functions are are the apply functions. Each apply function is used on a low level graphics primitive to compose our draw calls ([`cf_draw_elements`](../graphics/function/cf_draw_elements.md)).
+
+- [`cf_apply_canvas`](../graphics/function/cf_apply_canvas.md)
+- [`cf_apply_mesh`](../graphics/function/cf_apply_mesh.md)
+- [`cf_apply_shader`](../graphics/function/cf_apply_shader.md)
+- [`cf_draw_elements`](../graphics/function/cf_draw_elements.md)
+
+## Meshes
+
+The GPU wants to render triangles. A mesh contains triangle data and uploads them to the GPU. Typically a mesh is built on the CPU one-time, or updated with data each frame for animating geometry. The vertices of a mesh will be sent to a shader as inputs to the vertex shader.
+
+To construct a mesh the layout of the vertices in memory must be described. We do this with an array of vertex attributes [`CF_VertexAttribute`](../graphics/struct/cf_vertexattribute.md).
+
+> Example code snippet for filling out an array of vertex attributes.
+
+```cpp
+// Mesh + vertex attributes.
+draw->mesh = cf_make_mesh(CF_USAGE_TYPE_STREAM, CF_MB * 25, 0, 0);
+CF_VertexAttribute attrs[4] = { };
+attrs[0].name = "in_pos";
+attrs[0].format = CF_VERTEX_FORMAT_FLOAT2;
+attrs[0].offset = CF_OFFSET_OF(DrawVertex, position);
+attrs[1].name = "in_uv";
+attrs[1].format = CF_VERTEX_FORMAT_FLOAT2;
+attrs[1].offset = CF_OFFSET_OF(DrawVertex, uv);
+attrs[2].name = "in_col";
+attrs[2].format = CF_VERTEX_FORMAT_UBYTE4_NORM;
+attrs[2].offset = CF_OFFSET_OF(DrawVertex, color);
+cf_mesh_set_attributes(draw->mesh, attrs, CF_ARRAY_SIZE(attrs), sizeof(DrawVertex), 0);
+```
+
+The `"name"` in the above snippet corresponds to the name of vertex attribute inputs for a vertex shader (more on shaders later). The vertex data will need to be set with [`cf_mesh_update_vertex_data`](../graphics/function/cf_mesh_update_vertex_data.md).
+
+## Shaders
+
+Shaders are small programs that run on the GPU and transform vertices into pixels on the screen. The vertices match `"name"` of vertex attributes from the previous section. Let's check out a full vertex and fragment shader file.
+
+> A simplified version of CF's internal sprite shader.
+
+```glsl
+layout (location = 0) in vec2 in_pos;
+layout (location = 1) in vec2 in_uv;
+layout (location = 2) in vec4 in_col;
+
+layout (location = 0) out vec2 v_uv;
+layout (location = 1) out vec4 v_col;
+
+void main()
+{
+	vec4 posH = vec4(in_pos, 0, 1);
+	v_uv = in_uv;
+	v_col = in_col;
+	gl_Position = posH;
+}
+```
+
+```glsl
+layout (location = 0) in vec2 v_uv;
+layout (location = 1) in vec4 v_col;
+
+layout(location = 0) out vec4 result;
+
+layout (set = 2, binding = 0) uniform sampler2D u_image;
+
+layout (set = 3, binding = 0) uniform uniform_block {
+	vec2 u_texture_size;
+};
+
+#include "smooth_uv.shd"
+
+void main()
+{
+	vec4 c = de_gamma(texture(u_image, smooth_uv(v_uv, u_texture_size)));
+	if (c.a == 0) discard;
+	result = c;
+}
+```
+
+In CF shaders are written in GLSL (OpenGL Shading Language) version 450. This does not necessarily mean the backend powering the shaders is OpenGL, as the shaders are cross-compiled for all available backends.
+
+CF compiles shaders online making it very easy to write shaders once and have them _just work_ on all other platforms. Shader compilation is handled entirely by CF's own built-in compiler, [cute_spirv](glsl_support.md) — no external tools, no extra dependencies, and no meaningful impact on library size or startup time. The compiler emits SPIR-V for Vulkan, HLSL (compiled by the system's D3D compiler) for D3D12, Metal Shading Language for Metal, GLSL ES 300 for the GLES backend, and WGSL for the WebGPU backend.
+
+Let's focus on how to write your shaders and ship them with your game in a cross-platform way. You have a few options:
+
+- Compile shaders from glsl source on-disk
+- Compile shaders from glsl source from string (in-memory)
+- Compile shaders from bytecode (SPIRV)
+- Compile [draw-API compatible fragment shaders](drawing.md#shaders)
+
+To compile shaders from glsl source code on-disk you must first call [cf_shader_directory](../graphics/function/cf_shader_directory.md). This tells the application where the shader folder is. Shaders in this directory live-reload automatically when they change on-disk; to handle reloads yourself instead, setup a callback via [cf_shader_on_changed](../graphics/function/cf_shader_on_changed.md), which disables the automatic reload and hands notifications to you. Compile errors can be fetched with [cf_shader_compile_error](../graphics/function/cf_shader_compile_error.md) or reported through a [cf_shader_on_error](../graphics/function/cf_shader_on_error.md) callback. Once done you may then call [cf_make_shader](../graphics/function/cf_make_shader.md)
+
+To compile shaders from glsl source code from string (in-memory) simply call [cf_make_shader_from_source](../graphics/function/cf_make_shader_from_source.md).
+
+To compile shaders from bytecode (SPIRV) you must first compile them to a bytecode blob. This is a good way to speed up shader compilation when you ship your game, as the bytecode blobs can be shipped alongside your game. Call [cf_compile_shader_to_bytecode](../graphics/function/cf_compile_shader_to_bytecode.md) to generate a bytecode blob. You can then create a finalized shader by calling [cf_make_shader_from_bytecode](../graphics/function/cf_make_shader_from_bytecode.md).
+
+Shader compilation is explained in more details [here](shader_compilation.md).
+
+Be aware that shaders must adhere to strict rules for resource sets. See [Resource Set Layout](shader_compilation.md#resource-set-layout) for the full reference. In short: vertex shaders use sets 0-1, fragment shaders use sets 2-3, and compute shaders use sets 0-2.
+
+For uniforms you only have one uniform block available, and it *must* be named `uniform_block`. However, if your
+shader is make from the draw api (`cf_make_draw_shader`) uniform blocks must be named `shd_uniforms`.
+
+### Learning to Write Shaders
+
+Learning to write shaders can be very challenging at first. That's mostly because writing a shader requires a lot of prerequisite knowledge. But, once the prereqs are filled out writing shaders becomes quite easy with a little time and practice. Here are some prerequisites that will make writing shaders much easier:
+
+- Decent knowledge of linear algebra and vector math. Mainly coordinate space transforms, matrices, vectors, and the like.
+- Good overview knowledge of the typical graphics pipeline (covered briefly below with recommended readings).
+- Familiarity with colors and pixels.
+- Practice setting shaders up on the CPU-side (gathering vertices into a mesh, creating a material, etc.).
+
+A great way to learn all the fundamentals is to follow along the website [learnopengl.com](https://learnopengl.com/). Mainly the _Getting Started_ section, since it covers fundamental math and setup prereqs. However, we can do a short overview here as well as a refresher/primer!
+
+### Graphics Pipeline Overview
+
+A vertex is small chunk of data sent to the GPU. Usually they represent the points in a mesh, such as the points defining each triangle in a mesh. The vertex is an abstract concept and can actually contain any kind of data we like, not just positional data. Here's a common way to define a basic vertex in a 2D game.
+
+```cpp
+struct Vertex
+{
+	v2 position;    // The position of the vertex in 2D world space.
+	v2 uv;          // A coordinate from [0,1] for accessing texture image data.
+	CF_Color color; // An optional color component.
+};
+```
+
+We can see here the size of a vertex would be 2 floats + 2 floats + 4 floats, or 32 bytes. A single triangle would comprise of three vertices, or 96 bytes. The code snippet from the [Meshes](low_level_graphics.md#meshes) section above shows how we describe our vertex layout to the GPU. We must describe the vertex layout so the vertices can be uploaded and understood by shaders.
+
+Each vertex, once uploaded, will be sent to a vertex shader as inputs. The vertex shader will be called three times per triangle, each time a single vertex is sent to the vertex shader. The individual members of `Vertex` from the above example (`position`, `uv` and `color`) are called _attributes_ in graphics parlance. We can see in the example sprite, shader from the [Shaders](low_level_graphics.md#shaders) section of this document, the names of the attributes line up with names of glsl attributes in the vertex shader (specified with the `layout` and `in` keyword).
+
+Once the vertex shader processes a vertex it outputs a color. The color is then processed by the fragment shader. Optionally, attributes are interpolated between all three vertices of a triangle for a single invocation of the fragment shader. The GPU can automatically perform this interpolation for us. Rephrased: the fragment shader will be invoked one time per pixel, while the vertex shader is invoked one time per vertex -- the inputs to the fragment shader are the interpolated outputs of all three vertex shaders mixed together for each pixel.
+
+The fragment shader finally outputs the color for a single pixel within the triangle, once for each pixel. This produces the final image on the screen.
+
+> [!NOTE]
+> When we say "interpolated" it means the `varying` glsl keyword. We can see these interpolated values as outputs from the vertex shader in the [above sprite shader example](low_level_graphics.md#shaders). The vertex shaders specifies it's interpolated outputs with `out`, and the fragment shader collects those inputs with the same `in` keyword.
+
+We can visualize a set of steps a vertex will travel along to go from a sprite sitting on the CPU, to a pixel on the screen, for CF:
+
+1. [Sprites](drawing.md#drawing-sprites) sit around on the CPU waiting to be drawn.
+2. Once drawn, they are drawn relative to the [Camera](camera.md).
+3. CF collects all of the sprites and generates a big array of vertices for each sprite.
+4. All the vertices are uploaded to the GPU, invoking the vertex shader.
+5. The vertex shader outputs are interpolated and sent to the fragment shader.
+6. The fragment shader outputs pixel colors.
+
+In your own implementation, using the low level graphics API, you will need to define your own graphics pipeline. A more abstract version of these steps may look something like so:
+
+1. Meshes sit in model space.
+2. Transform meshes to world space.
+3. Transform meshes from world space to camera space.
+4. Upload meshes to the GPU.
+5. In the vertex shader vertices are transformed to view space.
+6. The vertex shader outputs are interpolated and used to invoke the fragment shader.
+7. The fragment shader clips vertices within the screen, and outputs pixels.
+
+These steps are a little simplified, but give one option for a good (but abstract) graphics pipeline. A good way to learn more is to take the keywords and search them, especially the various spaces. [learnopengl.com](https://learnopengl.com/) has a great page about [Coordinate Systems](https://learnopengl.com/Getting-started/Coordinate-Systems) describing these various mathematical spaces. These abstracts steps line up roughly with the steps outlined for CF.
+
+## Materials
+
+[CF_Material](../graphics/struct/cf_material.md) acts like a bag of inputs to shaders. Unlike meshes, materials don't hold vertices but instead hold uniforms and textures.
+
+### Uniforms
+
+A uniform is a global variable within either a vertex or fragment shader. The uniforms are defined in the shader itself using the `uniform` keyword. The sprite shader example from earlier specified some uniforms in the fragment shader like so:
+
+```glsl
+layout (set = 0, binding = 0) uniform sampler2D u_image;
+
+layout (set = 1, binding = 0) uniform fs_params {
+	vec2 u_texture_size;
+};
+```
+
+For vertex shaders textures have `set = 0`, while the uniform block has `set = 1`. For fragment shaders textures use `set = 2`, while the uniform block must use `set = 3`.
+
+In C++ we can set values for these uniforms by name using [`cf_material_set_uniform_vs`](../graphics/function/cf_material_set_uniform_vs.md) for vertex shaders, or [`cf_material_set_uniform_fs`](../graphics/function/cf_material_set_uniform_fs.md) for fragment shaders.
+
+[CF_Material](../graphics/struct/cf_material.md) has the cool feature to dynamically line up uniforms it stores with shaders. This means that a material can hold _many_ different uniforms, but only those that have a matching name will be sent to the shader. All other are simply ignored. This is great for making materials that can be applied to many different shaders, or making many different shaders that share a common material. Mix-and-matching is highly encouraged!
+
+You can set textures on a material as well via [`cf_material_set_texture_vs`](../graphics/function/cf_material_set_texture_vs.md) for the vertex shader, or [`cf_material_set_texture_fs`](../graphics/function/cf_material_set_texture_fs.md) for the fragment shader. More on textures in the next section.
+
+## Compute Shaders
+
+Compute shaders run on the GPU outside the normal graphics pipeline. They are available on SDL_GPU backends (Vulkan, D3D12, Metal) and on WebGPU. GLES3 has no real compute shaders, so CF emulates them there with draws, which rules out shared memory, barriers, atomics, and writes inside loops (see [the GLES3 limits](emscripten.md#gles3-backend-capabilities)). For the GLSL resource set layout rules and barrier safety, see [Resource Set Layout](shader_compilation.md#resource-set-layout).
+
+### Binding Resources from C
+
+Resources are bound through two mechanisms:
+
+- **Material** (name-matched): Sampled textures via [`cf_material_set_texture_cs`](../graphics/function/cf_material_set_texture_cs.md), uniforms via [`cf_material_set_uniform_cs`](../graphics/function/cf_material_set_uniform_cs.md).
+- **Dispatch struct** (positional): Read-write storage textures via `CF_ComputeDispatch::rw_textures`, readonly storage textures via `CF_ComputeDispatch::ro_textures`.
+
+```c
+// Bind sampled texture and uniform via material.
+cf_material_set_texture_cs(material, "u_input", my_texture);
+cf_material_set_uniform_cs(material, "u_time", &time, CF_UNIFORM_TYPE_FLOAT, 1);
+
+// Bind RW storage texture via dispatch and run.
+CF_ComputeDispatch dispatch = cf_compute_dispatch_defaults(width / 16, height / 16, 1);
+dispatch.rw_textures = &output_texture;
+dispatch.rw_texture_count = 1;
+cf_dispatch_compute(compute_shader, material, dispatch);
+```
+
+## Storage Buffers and Pull Instancing
+
+[`CF_StorageBuffer`](../graphics/struct/cf_storagebuffer.md) is raw GPU memory for data too large or too dynamic for uniforms: skinning palettes, particle pools, anything a compute shader writes. Create one with `cf_make_storage_buffer` (`cf_storage_buffer_defaults(size)` marks it `graphics_readable`), fill it with `cf_update_storage_buffer`, and bind after `cf_apply_shader`:
+
+```c
+cf_apply_shader(shader, material);
+cf_apply_vs_storage_buffers(&bones, 1); // Vertex stage; cf_apply_fs_storage_buffers for fragment.
+cf_draw_elements();
+```
+
+```glsl
+// Vertex stage: set = 0, bindings after any vertex-stage samplers.
+layout (std430, set = 0, binding = 0) readonly buffer bones_buffer { vec4 u_bones[]; };
+```
+
+Buffer-block tails must be scalars or vectors -- store mat4s as four `vec4` columns and reassemble in the shader.
+
+Storage buffers also unlock **pull instancing**: `cf_draw_elements_instanced(count)` draws the applied mesh `count` times with no per-instance vertex buffer at all, and the shader pulls its per-instance data by `gl_InstanceIndex`. This composes with compute -- a culling shader compacts visible instances into a buffer (`compute_writable` + `graphics_readable`), and the draw pulls from it with no CPU round trip.
+
+On GLES3, storage buffers are emulated through textures transparently: shaders read them with texture fetches, and emulated compute shaders write them with draws, under the same limits as compute shaders there. WebGPU has real storage buffers.
+
+## Range Draws and Geometry Arenas
+
+`cf_draw_elements_range(first, count, instance_count)` draws a contiguous sub-range of the applied mesh. Pack many small meshes into one big `CF_Mesh` (a *geometry arena*) and draw each piece by range -- nothing rebinds between draws, which is the cheap way to render many distinct small meshes. Indexed arenas write indices absolute into the shared vertex buffer; there is deliberately no base-vertex parameter, which is what keeps ranges portable to GLES3. The [3D drawing layer](drawing_3d.md#geometry-arenas) builds automatic batching on top of this with `cf_draw3d_mesh_range`.
+
+## Indirect Draws
+
+`cf_draw_elements_indirect(args, offset, draw_count)` reads its draw arguments (`CF_DrawIndirectArgs` / `CF_DrawIndexedIndirectArgs`) from a storage buffer created with `indirect_drawable`, instead of from the CPU. Combined with a compute shader that writes those arguments, this closes the GPU-driven loop: cull, compact, and draw without a readback. Available on SDL_GPU backends and WebGPU, but not on GLES3.
+
+## Standalone Samplers
+
+Textures bake their filter/wrap state at creation, which is the right default. When the same texture needs to be sampled two ways -- pixel-art NEAREST in world, LINEAR in a scaled UI, or a shadow map with and without hardware comparison -- make a [`CF_Sampler`](../graphics/struct/cf_sampler.md) and bind the pair:
+
+```c
+CF_SamplerParams sp = cf_sampler_defaults();
+sp.filter = CF_FILTER_LINEAR;
+CF_Sampler linear = cf_make_sampler(sp);
+cf_material_set_texture_fs_sampler(material, "u_image", texture, linear);
+```
+
+The plain `cf_material_set_texture_fs` keeps sampling through the texture's own baked state, so existing code is unaffected.
+
+## Multiple Render Targets
+
+A canvas can carry several color targets (`CF_CanvasParams::target_count`); the fragment shader writes `layout (location = N) out` per target -- the classic g-buffer setup. Each target can blend its own way: `CF_RenderState::blend` aliases `blends[0]`, and setting `blend_count` with `blends[1]`+ gives every target its own blend and write mask (accumulate HDR into target 0 while overwriting normals in target 1). Per-target blend works on SDL_GPU and WebGPU -- the GLES backend applies `blends[0]` to every target. `cf_canvas_get_target2(canvas, index)` fetches each result.
+
+How many targets depends on the device. `CF_MAX_CANVAS_TARGETS` (8) is the most any backend allows; `cf_query_max_canvas_targets()` returns what the current one allows:
+
+| Backend | Limit |
+| --- | --- |
+| D3D12, Metal | 8 |
+| Vulkan | 4 -- the spec guarantee; SDL_GPU doesn't expose the device's real `maxColorAttachments` |
+| GLES / WebGL2 | min(`GL_MAX_DRAW_BUFFERS`, `GL_MAX_COLOR_ATTACHMENTS`, 8); the spec guarantees 4 |
+| WebGPU | min(`maxColorAttachments`, `maxColorAttachmentBytesPerSample` / 8, 8), since an RGBA8 target costs 8 bytes per sample; the spec guarantees 4. Wider formats cost more |
+
+Four targets work everywhere. Past four, check the query and fall back (fewer targets, or a second pass) when it comes up short. Asking `cf_make_canvas` for more than the query allows asserts and returns an invalid canvas, rather than quietly giving you fewer targets than your shader writes.
+
+## Compressed Textures (DDS)
+
+PNG and JPG decode to raw RGBA8 -- fine for sprites, ruinous for texture-heavy 3D scenes, where block-compressed formats (BC1-BC7) are 4-8x smaller *on the GPU*, not just on disk. `cf_make_texture_from_dds` loads a DDS file -- the interchange format every texture tool exports -- and uploads its BC blocks and mip chain exactly as stored, no decode, no recompress. Cube maps and texture arrays load too, and sRGB variants map onto CF's sRGB pixel formats. Check `cf_texture_supports_format` when targeting GLES3/web (no BC support there; ship PNG fallbacks). The parser is [cute_dds.h](https://github.com/RandyGaul/cute_framework/blob/master/libraries/cute/cute_dds.h), a standalone single-file header like cute_png.h.
+
+## Textures
+
+Textures hold image data, as in pixels. Though in graphics we call them texels, not pixels. Actually, a texel can hold arbitrary data, but usually we just store one `vec4` (in glsl) or `CF_Color` (in C++) per pixel. Texture data is fetched from a shader using what's called uv-coordinates.
+
+UV-coordinates are two floats, each in the range from `[0,1]`. The coordinate (0, 0) is usually the top-left of a texture, while (1, 1) maps to the bottom-right of a texture. Each vertex typically has a unique uv coordinate used to fetch which pixel to draw.
+
+## Canvases
+
+[`CF_Canvas`](../graphics/struct/cf_canvas.md) represents a texture the GPU can render within. Instead of rendering to the screen itself, sometimes advanced rendering techniques require first rendering to a texture. This is common for some techniques such as reflections, or shadows. Here's an example image showing some basic reflections, using a canvas and some [stenciling techniques](https://en.wikipedia.org/wiki/Stencil_buffer).
+
+<p align="center">
+<img src=https://github.com/RandyGaul/cute_framework/blob/master/assets/block_man_final.gif?raw=true>
+</p>
+
+### Rendering into Faces, Layers, and Mips
+
+A canvas can attach an *existing* texture as its render target (`CF_CanvasParams::attach_target`) and address one slice of it: `attach_layer` picks a cube face or array layer, `attach_mip` picks a mip level. This is how multi-view techniques stay allocation-free -- six passes into one cube texture for point-light shadows, one pass per cascade into a depth 2D-array, and bloom chains that ping-pong between the mip levels of two textures so no pass ever samples what it writes (mark the texture `allocate_mipmaps` and upload/attach per mip; `cf_canvas_get_size` reports the attached mip's dimensions). The `point_light` and `fireflies` samples show the face and mip recipes respectively.
+
+### Sampling Depth While Depth-Testing
+
+Soft particles, water, decals and SDF occlusion all need to read the scene's depth while still depth-testing against it, and a pass can't sample the depth target it's attached to. [`cf_canvas_copy_depth`](../graphics/function/cf_canvas_copy_depth.md)`(dst, src)` copies a canvas's whole depth target into a second canvas: draw the scene, copy its depth, then draw effects into the scene canvas while they sample the copy through [`cf_canvas_get_depth_stencil_target`](../graphics/function/cf_canvas_get_depth_stencil_target.md). Both canvases need depth targets of the same size and format, and the copy's needs `CF_TEXTURE_USAGE_SAMPLER_BIT` (with `CF_FILTER_NEAREST`) to be sampled. The scene canvas needs neither, so its depth can stay a renderbuffer on OpenGL ES.
+
+### App's Default Render Canvas
+
+The app window itself has a [default canvas](application_window.md#resizing-windows). This canvas is used for higher-level [`Drawing API`](drawing.md) to get things onto the screen. By default CF collects everything and automatically displays it onto the default canvas.
+
+However, for custom rendering techniques you must fetch and render to the app's canvas to display rendered contents on the screen. Use [`cf_app_get_canvas`](../app/function/cf_app_get_canvas.md) along with [`cf_app_get_canvas_height`](../app/function/cf_app_get_canvas_height.md) and [`cf_app_get_canvas_width`](../app/function/cf_app_get_canvas_width.md). You may then render to this canvas (or any other canvas) with [`cf_render_to`](../draw/function/cf_render_to.md).

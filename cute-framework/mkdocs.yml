@@ -1,0 +1,264 @@
+# Project information
+site_name: Cute Framework
+site_url: https://RandyGaul.github.io/cute_framework/
+site_author: Randy Gaul
+site_description: >-
+  The cutest framework available for making 2D and 3D games in C/C++
+
+# Repository information
+repo_url: https://github.com/RandyGaul/cute_framework
+repo_name: RandyGaul/cute_framework
+
+# Copyright
+copyright: Copyright &copy; 2019—2025 Randy Gaul
+
+# Configuration
+theme:
+  name: material
+  logo: assets/logo.png
+  features:
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.path
+    - navigation.indexes
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme)"
+      scheme: cute
+      toggle:
+        icon: material/link
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: cute
+      toggle:
+        icon: material/toggle-switch
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: cute
+      accent: cute
+      toggle:
+        icon: material/toggle-switch-off
+        name: Switch to system preference
+
+extra_css:
+  - stylesheets/cute.css
+
+extra_javascript:
+  - javascripts/redirect.js
+
+# Navigation
+not_in_nav: |
+  /CPU/**
+  /allocator/**
+  /app/**
+  /array/**
+  /atomic/**
+  /audio/**
+  /binding/**
+  /base64/**
+  /collision/**
+  /coroutine/**
+  /draw/**
+  /file/**
+  /graphics/**
+  /haptic/**
+  /hash/**
+  /image/**
+  /input/**
+  /json/**
+  /list/**
+  /map/**
+  /math/**
+  /model/**
+  /multithreading/**
+  /net/**
+  /noise/**
+  /path/**
+  /physics/**
+  /png_cache/**
+  /custom_sprite/**
+  /random/**
+  /sprite/**
+  /string/**
+  /text/**
+  /time/**
+  /utility/**
+  /video/**
+  /web/**
+
+nav:
+  - Home: index.md
+  - Getting Started: getting_started.md
+  - Topics:
+      - Topics: topics/index.md
+      - Application Window: topics/application_window.md
+      - Game Loop and Time: topics/game_loop_and_time.md
+      - Application Callbacks: topics/app_callbacks.md
+      - File I/O: topics/file_io.md
+      - Drawing: topics/drawing.md
+      - 3D Drawing: topics/drawing_3d.md
+      - Shipping 3D: topics/shipping_3d.md
+      - Debug/Tools UI: topics/dear_imgui.md
+      - Allocators: topics/allocator.md
+      - Android Builds: topics/android.md
+      - Atomics: topics/atomics.md
+      - Audio: topics/audio.md
+      - Camera: topics/camera.md
+      - Collision: topics/collision.md
+      - Coroutines: topics/coroutines.md
+      - Custom Sprites: topics/custom_sprites.md
+      - Data Structures: topics/data_structures.md
+      - High-DPI Rendering: topics/hidpi.md
+      - Web Builds with Emscripten: topics/emscripten.md
+      - WebGPU: topics/webgpu.md
+      - Input: topics/input.md
+      - Input Bindings: topics/input_bindings.md
+      - macOS + iOS Builds: topics/ios.md
+      - Low Level Graphics: topics/low_level_graphics.md
+      - Multithreading: topics/multithreading.md
+      - Networking: topics/networking.md
+      - Physics: topics/physics.md
+      - Cute Protocol Standard: topics/protocol.md
+      - Random Numbers: topics/random_numbers.md
+      - A Tour of CF Renderer: topics/renderer.md
+      - Shader Compilation: topics/shader_compilation.md
+      - GLSL Support: topics/glsl_support.md
+      - Strings: topics/strings.md
+      - Virtual File System: topics/virtual_file_system.md
+      - HTTPS: topics/web.md
+      - Crash Reporting: topics/crash_reporting.md
+  - Samples:
+      - samples/index.md
+      # Sample pages are generated with tools/generate_sample_pages.rb by reading this file
+      - 9-Slice: samples/nine_slice.md
+      - Basic Camera: samples/basic_camera.md
+      - Basic Indexed Rendering: samples/basicindexedrendering.md
+      - Basic Instancing: samples/basicinstancing.md
+      - Basic Shapes: samples/basicshapes.md
+      - Basic Sprite: samples/basicsprite.md
+      - Billboards 3D: samples/billboards.md
+      - Blend Modes: samples/blend_modes.md
+      - Canvas Modes: samples/canvas_modes.md
+      - City 3D: samples/draw3d.md
+      - Clay UI: samples/clay.md
+      - Clay UI Animations: samples/clay_ui_animations.md
+      - Custom Shapes: samples/custom_shapes.md
+      - Custom Sprite: samples/customsprite.md
+      - Dear ImGui: samples/imgui.md
+      - Dear ImGui Texture: samples/imgui_texture.md
+      - Draw Lists: samples/draw_lists.md
+      - Draw to Texture: samples/draw_to_texture.md
+      - Easy Sprite: samples/easysprite.md
+      - Fetch Image: samples/fetch_image.md
+      - Fireflies: samples/fireflies.md
+      - Fluid Sim: samples/fluid_sim.md
+      - Font Debug: samples/font_debug.md
+      - Glitch: samples/glitch.md
+      - GPU Particles: samples/gpu_particles.md
+      - Hello Triangle: samples/hello_triangle.md
+      - HiDPI: samples/hidpi.md
+      - IME Text Input: samples/ime.md
+      - Import Spritesheet: samples/import_spritesheet.md
+      - Input Binding: samples/input_binding.md
+      - Joypad: samples/joypad.md
+      - Mandala: samples/mandala.md
+      - Metaballs: samples/metaballs.md
+      - Model 3D: samples/model3d.md
+      - Noise: samples/noise.md
+      - OBJ Loading: samples/obj_loading.md
+      - Outline (Stencil): samples/outline_stencil.md
+      - Physics: samples/physics.md
+      - Physics 3D: samples/physics3d.md
+      - Pivot: samples/pivot.md
+      - Pixel 3D: samples/pixel_3d.md
+      - Platformer: samples/platformer.md
+      - Polygon: samples/polygon.md
+      - Rainbow Liquid: samples/rainbow_liquid.md
+      - Recolor: samples/recolor.md
+      - Shallow Water: samples/shallow_water.md
+      - Skinning 3D: samples/skinning.md
+      - 3D Shapes: samples/shapes3d.md
+      - Point Light Shadows: samples/point_light.md
+      - Sound Pan: samples/sound_pan.md
+      - Space Shooter: samples/spaceshooter.md
+      - Stencil Pie Chart: samples/stencil_pie_chart.md
+      - Text Drawing: samples/textdrawing.md
+      - Tile Performance: samples/tile_perf.md
+      - Timestep: samples/timestep.md
+      - Transparency 3D: samples/transparency3d.md
+      - Vector Paths: samples/vector_paths.md
+      - Vector Text: samples/vector_text.md
+      - Waves: samples/waves.md
+      - Window Resizing: samples/windowresizing.md
+  - Made with CF: made_with_cf.md
+  - Community / Ask for Help: community_ask_for_help.md
+  - API Reference: api_reference.md
+
+# Plugins
+plugins:
+  - search:
+      separator: '[\s\-\_]+'
+  - social
+
+# Extensions
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - github-callouts
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      normalize_issue_symbols: true
+      repo_url_shorthand: true
+      user: squidfunk
+      repo: mkdocs-material
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      auto_append:
+        - includes/mkdocs.md
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      combine_header_slug: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/RandyGaul/cute_framework
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/ZvxfCyjZCj

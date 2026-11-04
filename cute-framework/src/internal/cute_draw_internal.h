@@ -1,0 +1,704 @@
+/*
+	Cute Framework
+	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
+
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
+*/
+
+#ifndef CF_DRAW_INTERNAL_H
+#define CF_DRAW_INTERNAL_H
+
+#include <cute_array.h>
+#include <cute_math.h>
+#include <cute_math3d.h>
+#include <cute_string.h>
+#include <cute_draw.h>
+#include <cute_graphics.h>
+
+#include <float.h>
+
+CF_API extern struct CF_Draw* s_draw; // Exported so the tests can inspect the layers when CF builds as a shared library.
+
+// Dash pattern for strokes (cf_draw_push_dash), all in world units. on == 0 means solid.
+struct CF_DrawDash { float on, off, phase; };
+
+// Shape effects (cf_draw_push_outline / cf_draw_push_glow). A zero width/radius disables that
+// effect; both zero means the command carries no effect block at all.
+struct CF_DrawEffects
+{
+	CF_Color outline;      // Premultiplied at capture.
+	float outline_width;
+	CF_Color glow;         // Premultiplied at capture.
+	float glow_radius;
+};
+
+// 2d depth (cf_draw_push_z), captured per geometry. The depth is a plane over the coverage
+// quad's ndc: depth = plane[0] * ndc.x + plane[1] * ndc.y + plane[2] (see s_depth_plane).
+struct CF_DrawDepth
+{
+	bool has_z; // Z was pushed: the geometry depth-tests, and writes depth when opaque.
+	float z;    // World z, in world units.
+	float plane[3];
+};
+
+// Half-width of the default depth range (world units) 2d Z maps into while no 3d projection is pushed.
+#define CF_DRAW_Z_RANGE 10000.0f
+
+enum BatchGeometryType : int
+{
+	BATCH_GEOMETRY_TYPE_TRI,
+	BATCH_GEOMETRY_TYPE_TRI_SDF,
+	BATCH_GEOMETRY_TYPE_QUAD,
+	BATCH_GEOMETRY_TYPE_SPRITE,
+	BATCH_GEOMETRY_TYPE_CIRCLE,
+	BATCH_GEOMETRY_TYPE_CAPSULE,
+	BATCH_GEOMETRY_TYPE_SEGMENT,
+	BATCH_GEOMETRY_TYPE_POLYGON,
+
+	// Polyline body: one capsule SDF clipped by hard bisector planes at interior
+	// joints. The bisector partition assigns every pixel to exactly one segment
+	// (translucent strokes never double-blend), and round joins/caps fall out of the
+	// capsule SDF clamping to the joint point -- no joint triangulation.
+	// shape[0]=a, shape[1]=b, shape[2]=plane0 n, shape[3]=plane1 n, shape[4]=(d0, d1).
+	// Mask keeps dot(n0,p)-d0 < 0 (strict) and dot(n1,p)-d1 <= 0, so the shared
+	// boundary belongs to exactly one side. Disabled planes: n=(0,0), d=1.
+	BATCH_GEOMETRY_TYPE_SEGMENT_CLIPPED,
+
+	// Directed arrow: capsule shaft unioned with a triangular head in one SDF command
+	// (no double-blend at the shaft/head seam). shape[0]=a, shape[1]=b,
+	// shape[2]=(shaft radius, head length/half-width).
+	BATCH_GEOMETRY_TYPE_ARROW,
+
+	// User-registered SDF (cf_make_custom_shape). shape[0..7] carry the 16 user params
+	// verbatim, n is the registry dispatch index, box holds the caller's pre-padded
+	// world bounds (also uploaded as payload P4 for the instanced VS coverage quad).
+	BATCH_GEOMETRY_TYPE_CUSTOM,
+
+	// CSG shape group head (cf_draw_shape_group_begin/end): one command compositing the
+	// `n` operand geoms that immediately follow it in the geometry stream (each tagged
+	// csg_operand with its own csg_op/csg_k). box holds the pre-padded union bounds.
+	BATCH_GEOMETRY_TYPE_CSG,
+
+	// Curve text glyph (cf_push_text_curves): rendered per-pixel from the glyph's
+	// quadratic Bezier outline instead of a rasterized atlas bitmap. The curves live in
+	// an atlas strip (see CF_CurveGlyph); the atlas item's uv rect locates it. shape[0..3]
+	// hold the outline box's world quad (TL,TR,BR,BL like sprites), n is the curve count,
+	// box the padded coverage quad. stroke > 0 renders an outline instead of a fill.
+	BATCH_GEOMETRY_TYPE_GLYPH,
+};
+
+struct BatchGeometry
+{
+	BatchGeometryType type;
+	CF_Color color; // Premultiplied. Stays float end-to-end so HDR channels (> 1.0) survive.
+	CF_V2 box[4]; // World-space AABB coverage corners.
+	int n; // Only needed/used for polygon.
+	CF_V2 shape[8];
+	float alpha;
+	float radius;
+	float stroke;
+	float aa;
+	CF_DrawDash dash; // Captured from the dash stack; on == 0 means solid.
+	CF_DrawEffects fx; // Captured from the outline/glow stacks.
+	CF_DrawDepth depth; // Captured from the z stack.
+	bool is_text;
+	bool is_sprite;
+	bool fill;
+	bool use_tri_colors;      // Per-vertex colors for triangles.
+	bool use_tri_attributes;  // Per-vertex attributes for triangles.
+	bool csg_operand;         // Operand of a preceding CSG head; skipped by direct walks.
+	int csg_op;               // CF_ShapeOp folding this operand into the running distance.
+	float csg_k;              // Smoothing constant for csg_op (0 = hard min/max).
+	int blend;                // CF_DrawBlend. Runs split at changes; see s_flush_pending_geoms.
+	CF_Color user_params;
+	// Text glyphs and raw triangles are mutually exclusive; overlay their extras.
+	union {
+		struct {
+			CF_Color text_colors[4]; // Per-corner: TL, TR, BR, BL (for text glyphs). Premultiplied.
+		};
+		struct {
+			CF_Color tri_colors[3];      // Per-vertex colors (only for BATCH_GEOMETRY_TYPE_TRI). Premultiplied.
+			CF_Color tri_attributes[3];  // Per-vertex attributes (only for BATCH_GEOMETRY_TYPE_TRI).
+		};
+	};
+	CF_M3x2 mvp; // Record-time camera transform. The command paths invert this on the
+	             // GPU to recover world space per-pixel for SDF evaluation.
+};
+
+// The atlas cache's opaque per-entry `udata` carries an index back into the
+// unified geometry stream (CF_Command::geoms). Atlas uvs come back via the callback.
+#define ATLAS_CACHE_ASSERT CF_ASSERT
+#include <cute/cute_atlas_cache.h>
+
+struct CF_Strike
+{
+	CF_V2 p0, p1;
+	float thickness;
+	CF_Color color;
+};
+
+// Baked vector path (cf_draw_path_end): quadratic Beziers encoded into an RGBA8 atlas
+// block exactly like curve-text glyph strips (3 texels per curve, 16-bit fixed-point
+// coords as fractions of box_min..box_max), except paths may span multiple rows.
+// Keyed by image_id (the public CF_DrawPath id) in CF_Draw::draw_paths.
+struct CF_DrawPathData
+{
+	CF_Pixel* pixels;
+	int curve_count;
+	int strip_w; // Texel dimensions of the encoded block.
+	int strip_h;
+	CF_V2 box_min; // Path bounds in local units, the quantization box.
+	CF_V2 box_max;
+};
+
+// Per-flush sprite/text atlas record, parallel to CF_Draw::pending_geoms. Filled by the
+// atlas_cache callbacks; texture_id stays 0 for shapes.
+struct CF_PendingUV
+{
+	uint64_t texture_id;
+	float minx, miny, maxx, maxy;
+	int tex_w, tex_h;
+};
+
+//--------------------------------------------------------------------------------------------------
+// Command renderer (see s_draw_report_tiled in cute_draw.cpp).
+//
+// Every drawable uploads one compact command plus a small payload. Two GPU paths share
+// that upload: the instanced path expands coverage quads in the vertex shader and
+// rasterizes (best at moderate overdraw), while the tiled path bins commands into
+// per-16px-tile lists with compute and composites in-register per pixel (best when its
+// opaque-cover cull engages). Auto routing picks per batch; both preserve paint order.
+
+#define CF_TILE_PX 16 // Tile size in pixels. Must be even (keeps 2x2 fragment quads within one tile).
+
+// Mirrors the `Cmd` struct in the s_tile_fs builtin shader (std430, five vec4s).
+// Colors travel as packed half4 (two packHalf2x16 words: rg then ba) instead of unorm8
+// so HDR draw colors reach the shader intact.
+struct CF_TileCmd
+{
+	float aabb[4];    // Pixel-space bounds, top-left origin: min.xy, max.xy.
+	uint32_t type;    // Shape type id, 0-11 (see s_tile_fs / s_inst_vs). Flags: 16 dashed, 32 user field (untrusted distance).
+	uint32_t color;   // packHalf2x16(premultiplied rg); ba rides in color_ba below.
+	uint32_t payload; // Offset into the payload buffer, in vec4 units.
+	uint32_t inv_mvp; // Offset of the inverse mvp (2 vec4s) in the payload buffer. SDF shapes only.
+	float radius, stroke, aa, alpha;
+	float fill, n, opaque; // opaque: filled SDF shape at full alpha AND normal blend -- opaque-cover cull candidate.
+	uint32_t color_ba; // packHalf2x16(premultiplied ba); shader reads it via floatBitsToUint(misc.w).
+	float user[4]; // User params (ShaderParams.attributes for custom draw shaders).
+	// Shape effects (cf_draw_push_outline / _glow). x: payload offset of the effect block in
+	// vec4 units, as float bits; 0 means no effects. y: how far past the shape's own extent the
+	// effects reach (the glow radius; outlines stay inside), so coverage quads and tile culling
+	// can pad for it. z: payload offset of the 2d depth block (plane a, b, c, depth write) as
+	// float bits; 0 means no Z. Instanced path only -- Z batches never take the tile walk.
+	// w reserved.
+	float fx[4];
+};
+
+struct CF_TileV4 { float x, y, z, w; };
+
+// Pure helpers, unit-tested in test/test_draw_tiled.cpp. CF_API so the tests still
+// link when CF builds as a shared library.
+
+// Inclusive tile bounds covering a pixel-space AABB. Returns false when fully outside the grid.
+CF_API bool CF_CALL cf_tile_range(float min_x, float min_y, float max_x, float max_y, int tiles_x, int tiles_y, int* x0, int* y0, int* x1, int* y1);
+
+// Runtime toggles for tests, samples, and perf comparison. The setters force a path;
+// cf_draw_set_tiled_auto restores the default per-batch heuristics (tiled only when
+// opaque-cover culling looks profitable; GPU binning for big-footprint batches).
+CF_API void CF_CALL cf_draw_set_tiled_enabled(bool enabled);
+CF_API bool CF_CALL cf_draw_get_tiled_enabled();
+CF_API bool CF_CALL cf_draw_tiled_available();
+CF_API void CF_CALL cf_draw_set_tiled_auto();
+
+// Overrides the tiled batch footprint budget (bin list entries; see CF_Draw). Tests use
+// a tiny budget to exercise the instanced fallback.
+CF_API void CF_CALL cf_draw_set_tiled_list_budget(uint64_t entries);
+
+// Returns and resets per-interval counters: batches drawn via the tile walk, batches
+// drawn via the instanced path, and bytes uploaded. Call once per frame for stats.
+CF_API void CF_CALL cf_draw_tiled_stats(int* tiled_batches, int* instanced_batches, uint64_t* upload_bytes);
+
+struct CF_DrawUniform
+{
+	const char* name = NULL;
+	void* data = NULL;
+	int size = 0;
+	CF_UniformType type = CF_UNIFORM_TYPE_UNKNOWN;
+	int array_length = 0;
+	bool is_texture = false;
+	CF_Texture texture = { 0 };
+};
+
+// CF_RenderState as a command stores it. Commands are copied, compared and sorted per draw, so
+// they keep only blends[0] inline; per-target blends (blend_count > 1) are interned in
+// CF_Draw::blend_sets. Otherwise field-for-field with CF_RenderState.
+struct CF_CmdRenderState
+{
+	CF_PrimitiveType primitive_type;
+	CF_CullMode cull_mode;
+	CF_BlendState blend;
+	int blend_set; // Index into CF_Draw::blend_sets, -1 when every target shares `blend`.
+	int blend_count;
+	bool alpha_to_coverage;
+	CF_CompareFunction depth_compare;
+	bool depth_write_enabled;
+	CF_StencilParams stencil;
+	float depth_bias_constant_factor;
+	float depth_bias_clamp;
+	float depth_bias_slope_factor;
+	bool enable_depth_bias;
+	bool enable_depth_clip;
+
+	CF_CmdRenderState() { CF_MEMSET((void*)this, 0, sizeof(*this)); blend_set = -1; } // Zeroed padding keeps operator== a memcmp.
+	CF_CmdRenderState(const CF_RenderState& rs);
+	CF_RenderState expand() const;
+	bool operator==(const CF_CmdRenderState& o) const { return !CF_MEMCMP(this, &o, sizeof(*this)); }
+	bool operator==(const CF_RenderState& rs) const { return *this == CF_CmdRenderState(rs); }
+};
+static_assert(sizeof(CF_CmdRenderState) == sizeof(CF_RenderState) - (CF_MAX_CANVAS_TARGETS - 1) * sizeof(CF_BlendState) + sizeof(int), "CF_CmdRenderState must mirror CF_RenderState.");
+
+struct CF_BlendSet { CF_BlendState blends[CF_MAX_CANVAS_TARGETS]; };
+
+struct CF_Command
+{
+	int layer = 0; // The layer whose queue this command lives in (see CF_DrawLayer).
+	CF_Rect scissor = { 0, 0, -1, -1 };
+	CF_Rect viewport = { 0, 0, -1, -1 };
+	float alpha_discard = 1.0f;
+	CF_DrawFilterMode filter_mode = CF_DRAW_FILTER_SMOOTH;
+	CF_CmdRenderState render_state;
+	// Draw list closure semantics: the render state was pushed OUTSIDE the recording, so it
+	// stays a free variable -- cf_draw_list binds whatever is pushed then (the 2d stack for
+	// 2d commands, the 3d stack for mesh commands). Always false outside a recording.
+	bool ambient_render_state = false;
+	CF_Shader shader;
+	Cute::Array<atlas_cache_entry_t> items; // Sprite/text atlas entries; udata indexes `geoms`.
+	CF_DrawUniform u;
+	bool is_canvas = false;
+	CF_Canvas canvas = { 0 };
+	CF_V2 canvas_verts[4];
+	CF_V2 canvas_verts_posH[4];
+	CF_Color canvas_attributes = cf_color_clear();
+	// Every drawable's geometry in record (paint) order -- shapes, sprites, text.
+	// Sprites/text additionally have an `items` atlas entry whose seq indexes here.
+	Cute::Array<BatchGeometry> geoms;
+	// Draw list replay (cf_draw_list): geometry borrowed from the list, flattened into
+	// the pending stream at collate time with replay_mvp composed on and the AA band
+	// rescaled -- replays never deep-copy geometry. NULL for ordinary commands.
+	const Cute::Array<BatchGeometry>* geoms_ref = NULL;
+	CF_M3x2 replay_mvp;
+	float replay_aa_scale = 1.0f;
+	// Replay-time 2d depth: z offsets every replayed geometry's z (Z is list-local, like layers),
+	// a z pushed at replay makes the whole replay depth-aware, and depth planes come from the
+	// 3d camera live at replay (replay_vp3d, when replay_has_cam3d).
+	float replay_z = 0;
+	bool replay_has_z = false;
+	bool replay_has_cam3d = false;
+	CF_M4x4 replay_vp3d;
+	// 3d mesh submission payload (cf_draw3d_mesh), owned by this command and freed via
+	// cf_draw3d_free_cmd when the command is destroyed. See cute_draw3d.cpp.
+	struct CF_MeshCmd3d* mesh3d = NULL;
+	// View-space depth of the farthest submission anchor in this mesh command, captured at
+	// submit time. The flush sorts non-depth-writing (translucent) mesh commands within a
+	// layer back-to-front on this key; opaque commands ignore it (the depth test owns them).
+	float depth3d = 0;
+};
+
+// Layers are first class: every command lives in the queue of the layer it was
+// submitted on, in submission order. Switching layers simply moves command
+// submission to a different layer's queue. When the layers are flushed with
+// `cf_render_layers_to`, they are visited in layer order instead of being
+// sorted.
+// At the end of a frame, unused layers are pruned.
+//
+// Commands are classified into:
+//
+// * Drawing: 2d geometry, a draw list replay, a canvas blits, or a mesh submission.
+// * Non-drawing: empty command (cf_cmd_is_empty) or a state-change command
+//   carrying only a uniform / texture set.
+//
+// To keep render state correct when commands can be submitted into multiple layers,
+// we maintain "the tail invariant": Only the current layer's queue may end in non-drawing
+// commands. On a layer switch, the tail run of non-drawing commands from the old
+// layer is moved into the new layer. Thus, they will set the render states for
+// the draws on the new layer.
+struct CF_DrawLayer
+{
+	int layer = 0;
+	bool touched = false; // A command was appended this frame.
+	Cute::Array<CF_Command> cmds;
+};
+
+// True for a command that draws nothing and carries no state change -- notably the spacer
+// commands mesh submission leaves on top of the stream (see s_submit in cute_draw3d.cpp).
+// The one definition shared by coalescing and the flush's run scans.
+CF_INLINE bool cf_cmd_is_empty(const CF_Command& cmd)
+{
+	return !cmd.mesh3d && !cmd.is_canvas && !cmd.geoms.count() && !cmd.items.count()
+		&& !cmd.geoms_ref && !cmd.u.name && !cmd.u.is_texture;
+}
+
+// True for a command that draws something: 2d geometry, a draw list replay, a
+// canvas blits, or a mesh submission.
+CF_INLINE bool cf_cmd_is_drawing(const CF_Command& cmd)
+{
+	return cmd.mesh3d || cmd.is_canvas || cmd.geoms.count() || cmd.geoms_ref;
+}
+
+// Pushes a sprite/text atlas entry whose geometry was just appended via s_push_geom().
+#define DRAW_PUSH_ITEM(s) \
+	do { \
+		CF_Command& cmd__ = s_draw->current_cmd(); \
+		(s).udata = (ATLAS_CACHE_U64)(cmd__.geoms.count() - 1); \
+		cmd__.items.add(s); \
+	} while (0)
+
+#define PUSH_DRAW_VAR(var) \
+	s_draw->var##s.add(var)
+
+#define POP_DRAW_VAR(var) \
+	if (s_draw->var##s.count() > 1) { \
+		auto var = s_draw->var##s.pop(); \
+		return var; \
+	} else { \
+		return s_draw->var##s.last(); \
+	}
+
+#define PUSH_DRAW_VAR_AND_ADD_CMD_IF_NEEDED(var) \
+	if (s_draw->var##s.last() != var) { \
+		CF_Command& cmd = s_draw->add_cmd(); \
+		cmd.var = var; \
+	} \
+	PUSH_DRAW_VAR(var)
+
+#define POP_DRAW_VAR_AND_ADD_CMD_IF_NEEDED(var) \
+	if (s_draw->var##s.count() > 1) { \
+		auto result = s_draw->var##s.pop(); \
+		if (s_draw->var##s.last() != result) { \
+			CF_Command& cmd = s_draw->add_cmd(); \
+			cmd.var = s_draw->var##s.last(); \
+		} \
+		return result; \
+	} else { \
+		return s_draw->var##s.last(); \
+	}
+
+#define ADD_UNIFORM(u) \
+	s_draw->add_cmd().u = u
+
+struct CF_Draw
+{
+	// Stamps the tops of the pipeline/state stacks onto a command.
+	CF_INLINE void stamp_state(CF_Command& cmd) {
+		cmd.scissor = scissors.last();
+		cmd.viewport = viewports.last();
+		cmd.alpha_discard = alpha_discards.last();
+		cmd.filter_mode = filter_modes.last();
+		cmd.render_state = render_states.last();
+		cmd.ambient_render_state = render_state_is_ambient();
+		cmd.shader = shaders.last();
+	}
+	// True while recording a draw list with no render state pushed inside the recording.
+	CF_INLINE bool render_state_is_ambient() const {
+		return recording_list && render_states.count() <= recording_render_state_base;
+	}
+	CF_INLINE bool state_matches(const CF_Command& cmd) const {
+		return cmd.scissor == scissors.last()
+			&& cmd.viewport == viewports.last()
+			&& cmd.alpha_discard == alpha_discards.last()
+			&& cmd.filter_mode == filter_modes.last()
+			&& cmd.render_state == render_states.last()
+			&& cmd.ambient_render_state == render_state_is_ambient()
+			&& cmd.shader == shaders.last();
+	}
+	// Appends a command carrying the current state to `dl`, stamped with that layer's id.
+	// The layer object is the truth, not the `layers` stack: cf_draw_push_layer switches
+	// layers before it pushes the stack.
+	CF_INLINE CF_Command& add_cmd_to(CF_DrawLayer* dl) {
+		CF_Command& cmd = dl->cmds.add();
+		cmd.layer = dl->layer;
+		dl->touched = true;
+		stamp_state(cmd);
+		return cmd;
+	}
+	// Appends a command carrying the current state to the current layer's queue.
+	CF_INLINE CF_Command& add_cmd() { return add_cmd_to(current_layer); }
+	// The current layer's queue and its last command -- the one drawing appends to.
+	CF_INLINE Cute::Array<CF_Command>& current_cmds() { return current_layer->cmds; }
+	CF_INLINE CF_Command& current_cmd() { return current_layer->cmds.last(); }
+	// The CF_DrawLayer for `layer`, inserting an empty one when absent. Layers are heap
+	// objects so the pointer stays valid across later inserts.
+	CF_DrawLayer* ensure_layer(int layer);
+	// Moves the cursor to `layer` (creating it), carrying along the non-drawing tail of the
+	// layer being left, then re-establishes the tail invariant via sync_current_cmd.
+	void switch_layer(int layer);
+	// Re-establishes the tail invariant: reuses the current layer's last command when it
+	// can, restamps it when it draws nothing yet, appends otherwise.
+	void sync_current_cmd();
+	// Frees every queued command's payload and clears every layer's queue (frame end / destroy).
+	void clear_layers();
+	// Frame-end housekeeping for the layer set: deletes layers no command touched this frame
+	// (a game y-sorting via one layer int per object would otherwise accumulate them forever)
+	// and clears `touched` on the rest. Leaves `current_layer` NULL; call switch_layer afterwards.
+	void prune_idle_layers();
+	// Deletes the CF_DrawLayer objects in `draw_layers` (payloads must already be released)
+	// and empties the array.
+	static void free_layers(Cute::Array<CF_DrawLayer*>& draw_layers);
+
+	// Every layer that has a queue, sorted ascending by layer id. `current_layer` is the one
+	// for the top of the `layers` stack (NULL only transiently, while no layer is current).
+	//
+	// The tail invariant: Only the current layer's queue may end in non-drawing commands.
+	//
+	// Every drawable appended to current_cmd() trusts this without checking. Any operation
+	// that can break it must call sync_current_cmd before returning to the caller:
+	//   - the flush (cf_render_layers_to) drains the current layer's queue;
+	//   - cf_draw_list replay appends borrowed-geometry commands to it;
+	//   - draw list recording parks and restores the layer set;
+	//   - the frame-end reset clears every layer's queue;
+	//   - a layer switch lands on a layer whose queue was last stamped under some earlier state.
+	// The state-push macros keep it by construction: a state change opens a new command
+	// carrying the new state, so the stamp never lags the stacks. Other layers are free to
+	// violate all of this -- nothing appends to a layer that is not current.
+	Cute::Array<CF_DrawLayer*> sorted_layers;
+	CF_DrawLayer* current_layer = NULL;
+	Cute::Array<CF_Command> carry_scratch; // switch_layer's carry buffer for the non-drawing tail (keeps its capacity).
+	// The command the flush is currently processing; the tiled path reads its state.
+	CF_Command* processing_cmd = NULL;
+	CF_V2 atlas_dims = cf_v2(2048, 2048);
+	CF_V2 texel_dims = cf_v2(1.0f/2048.0f, 1.0f/2048.0f);
+	bool delay_defrag = false;
+	// Latch for cf_atlas_defrag_once: defrag walks every atlas and can rebuild pages
+	// (re-fetching their pixels), so flush sites run it at most once per frame. Reset at
+	// cf_app_update; images first seen after this frame's defrag ride the lonely buffer
+	// until the next frame packs them.
+	bool defragged_this_frame = false;
+	atlas_cache_t atlas_cache;
+	// Sprite-atlas mip settings (cf_draw3d_mips / cf_draw3d_anisotropy). A count of 1 means
+	// no mip chain. Changing either rebuilds the atlas cache.
+	int atlas_mip_count = 1;
+	int atlas_anisotropy = 1;
+	// Premade atlas registrations (cf_register_premade_atlas), flattened so atlas cache
+	// rebuilds (atlas dims or mip settings changing) can re-register them: one record per
+	// premade atlas, its entries concatenated in registration order.
+	struct PremadeRecord { uint64_t texture_id; int w, h, entry_count; };
+	Cute::Array<PremadeRecord> premade_atlas_records;
+	Cute::Array<atlas_cache_premade_entry_t> premade_atlas_entries;
+	CF_Material material;
+	CF_Arena uniform_arena;
+	Cute::Array<float> alpha_discards = { 1.0f };
+	Cute::Array<CF_DrawFilterMode> filter_modes = { CF_DRAW_FILTER_SMOOTH };
+	Cute::Array<CF_SpriteEdge> sprite_edges = { CF_SPRITE_EDGE_SOFT };
+	Cute::Array<int> blends = { 0 }; // CF_DrawBlend stack (cf_draw_push_blend).
+	Cute::Array<CF_Color> colors = { cf_color_white() };
+	Cute::Array<CF_DrawDash> dashes = { { 0, 0, 0 } }; // cf_draw_push_dash stack; on = 0 means solid.
+	Cute::Array<CF_Color> outlines = { { 0, 0, 0, 0 } }; // cf_draw_push_outline stack.
+	Cute::Array<float> outline_widths = { 0 };
+	Cute::Array<CF_Color> glows = { { 0, 0, 0, 0 } };    // cf_draw_push_glow stack.
+	Cute::Array<float> glow_radii = { 0 };
+	Cute::Array<float> antialias = { 1.5f };
+	Cute::Array<CF_RenderState> render_states;
+	// Interned per-target blends of commands (CF_CmdRenderState::blend_set). Blend states are all
+	// enums and bools, so a program only ever uses a handful; never freed.
+	Cute::Array<CF_BlendSet> blend_sets;
+	Cute::Array<CF_Rect> scissors = { { 0, 0, -1, -1 } };
+	Cute::Array<CF_Rect> viewports = { { 0, 0, -1, -1 } };
+	Cute::Array<int> layers = { 0 };
+	// cf_draw_push_z stack. Only the default entry means "no Z": 2d draws skip depth entirely.
+	Cute::Array<float> zs = { 0 };
+	// Last depth plane computed in s_push_geom, reused while z and the 3d camera hold still.
+	float depth_cache_z = 0;
+	uint64_t depth_cache_cam = 0;
+	bool depth_cache_valid = false;
+	float depth_cache_plane[3];
+	Cute::Array<CF_M3x2> cam_stack = { cf_make_identity() };
+	Cute::Array<CF_M3x2> projection_stack;
+	float aaf = 0;
+	CF_M3x2 projection;
+	CF_M3x2 default_projection; // The last projection CF set itself; cf_draw_on_app_canvas_resized tells it apart from a user's.
+	CF_M3x2 mvp;
+	void reset_cam();
+	void set_aaf();
+	Cute::Array<CF_Color> user_params = { cf_color_clear() };
+	Cute::Array<CF_Color> tri_colors0 = { cf_color_white() };
+	Cute::Array<CF_Color> tri_colors1 = { cf_color_white() };
+	Cute::Array<CF_Color> tri_colors2 = { cf_color_white() };
+	Cute::Array<CF_Color> tri_attributes0 = { cf_make_color_hex(0) };
+	Cute::Array<CF_Color> tri_attributes1 = { cf_make_color_hex(0) };
+	Cute::Array<CF_Color> tri_attributes2 = { cf_make_color_hex(0) };
+	Cute::Array<CF_Shader> shaders;
+	Cute::Array<CF_V2> temp;
+	Cute::Array<float> font_sizes = { 18 };
+	Cute::Array<const char*> fonts = { sintern("Calibri") };
+	Cute::Array<int> blurs = { 0 };
+	Cute::Array<float> text_wrap_widths = { FLT_MAX };
+	Cute::Array<bool> vertical = { false };
+	Cute::Array<uint64_t> text_ids = { 0 };
+	Cute::Array<CF_Strike> strikes;
+	Cute::Array<CF_Strike> underlines;
+	Cute::Array<bool> text_effects = { true };
+	Cute::Array<bool> text_curves = { true };
+	Cute::Array<float> text_strokes = { 0 };
+	Cute::Map<CF_AtlasSubImage> premade_sub_image_id_to_sub_image;
+	// Baked vector paths (cf_draw_path_end), keyed by image id in the path id range.
+	Cute::Map<CF_DrawPathData> draw_paths;
+	uint64_t path_image_id_gen = 0; // Seeded to CF_PATH_ID_RANGE_LO in cf_make_draw.
+	// Retained draw lists (cf_make_draw_list). While recording, the live layers are parked
+	// in recording_saved_layers and commands accumulate in a private set of layers that
+	// moves into the list at cf_draw_list_end.
+	Cute::Map<struct CF_DrawListData*> draw_lists;
+	uint64_t draw_list_id_gen = 1;
+	struct CF_DrawListData* recording_list = NULL;
+	// Render states at or below this depth are ambient to the recording (see
+	// CF_Command::ambient_render_state).
+	int recording_render_state_base = 0;
+	Cute::Array<CF_DrawLayer*> recording_saved_layers;
+	CF_DrawLayer* recording_saved_current_layer = NULL;
+	// User SDF snippets registered via cf_make_custom_shape, in dispatch-index order.
+	// Stitched into custom_shapes.shd and compiled into every SDF command pipeline.
+	Cute::Array<Cute::String> custom_shape_srcs;
+	// CSG shape group recording state (cf_draw_shape_group_begin/op/end). While active,
+	// SDF shape recorders stage into group_geoms instead of emitting commands.
+	bool shape_group_active = false;
+	int shape_group_op = 0;
+	float shape_group_k = 0;
+	Cute::Array<BatchGeometry> group_geoms;
+	Cute::Map<uint64_t> draw_shd_to_blit_shd;
+	Cute::Map<const char*> shader_paths; // shader.id -> interned file path for reload
+	bool blit_init = false;
+	CF_Mesh blit_mesh = { 0 };
+	bool need_flush = false;
+	bool has_drawn_something = false;
+
+	// All geometry for the current flush run in paint order, with a parallel per-entry
+	// uv record for sprites/text (filled by the atlas callbacks; texture_id 0 for
+	// shapes). After the flush the stream renders in paint order, splitting into a new
+	// draw wherever the bound atlas texture changes -- paint order holds across atlas
+	// textures.
+	Cute::Array<BatchGeometry> pending_geoms;
+	Cute::Array<CF_PendingUV> pending_uvs;
+	CF_Texture white_texture = { 0 }; // Bound as u_image for shape-only draws.
+
+	// Tiled renderer state. Modes: 0 = auto (per-batch profitability heuristics),
+	// 1 = force off/CPU, 2 = force on/GPU.
+	bool tiled_available = false;
+	int tiled_mode = 0;     // Auto routes a batch tiled only when opaque-cover culling looks profitable.
+	int tiled_threshold = 1; // Minimum batch item count to take the tiled path.
+	// Max sum of per-command tile footprints for a tiled batch (bin list entries, 4B
+	// each; 8M = 32MB). Batches over budget route instanced -- correctness never
+	// depends on the tiled path, so the cap only trades its opaque-cover cull away.
+	uint64_t tiled_list_budget = 8 * 1024 * 1024;
+	CF_RenderState default_render_state;
+	CF_Mesh tile_mesh = { 0 }; // Fullscreen triangle.
+	CF_Mesh corner_mesh = { 0 }; // Six corner indices; instanced command-fed mesh path.
+	bool instanced_available = false;
+	CF_Material tile_material_cs = { 0 }; // Uniforms for the binning compute dispatches.
+	CF_StorageBuffer tile_cmds_buf = { 0 };
+	CF_StorageBuffer tile_payload_buf = { 0 };
+	CF_StorageBuffer tile_headers_buf = { 0 };
+	CF_StorageBuffer tile_list_buf = { 0 };
+	int tile_headers_cap = 0; // Byte capacities for the GPU-written buffers.
+	int tile_list_cap = 0;
+	Cute::Array<CF_TileCmd> tile_cmds;
+	Cute::Array<CF_TileV4> tile_payload;
+	// Per-frame stats for perf inspection (reset in cf_app_draw_onto_screen path).
+	int tiled_batch_count = 0;
+	int instanced_batch_count = 0;
+	uint64_t tiled_upload_bytes = 0;
+
+	// Samplers for filter mode (backend-specific, stored as void* for cross-platform compatibility)
+	void* sampler_nearest = NULL;
+	void* sampler_linear = NULL;
+};
+
+// Retained draw list contents: deep copies of recorded commands (list-local
+// transforms; replay composes the current camera on top), grouped by layer in layer
+// order and in record order within a layer, plus owned copies of any recorded uniform
+// data (the live path arena resets every frame).
+struct CF_DrawListData
+{
+	Cute::Array<CF_Command> cmds;
+	Cute::Array<void*> uniform_blocks;
+	// The layer that was current at cf_draw_list_begin. Recorded layers are relative to it:
+	// replay shifts every command by (current layer - base_layer).
+	int base_layer = 0;
+	// The z current at cf_draw_list_begin. Recorded z is relative to it, like layers.
+	float base_z = 0;
+};
+
+void cf_make_draw();
+void cf_destroy_draw();
+void cf_destroy_all_fonts();
+
+// 3d mesh submission layer (cute_draw3d.cpp). Made/destroyed inside cf_make_draw and
+// cf_destroy_draw; cf_draw3d_process renders one mesh command from s_process_command after
+// pending 2d geometry has flushed; cf_draw3d_free_cmd releases a command's mesh payload.
+void cf_make_draw3d();
+void cf_destroy_draw3d();
+void cf_draw3d_process(CF_Command* cmd, CF_Canvas canvas, bool clear);
+void cf_draw3d_free_cmd(CF_Command* cmd);
+
+// Runs the atlas defrag at most once per frame (see CF_Draw::defragged_this_frame).
+void cf_atlas_defrag_once();
+
+// Called when the app's offscreen canvas is recreated: rebuilds the default 2d projection to span
+// w by h, refreshes the mvp + AA factor so the very next draw sees it, and swaps the new default
+// into any cf_draw_push-saved copies of the old one so a pop cannot restore a stale size. The
+// automatic path (window resize, density change, cf_app_set_size, cf_app_set_msaa) passes the
+// window size in LOGICAL POINTS -- never the canvas's pixel size, which halves everything on a 2x
+// display -- and cf_app_set_canvas_size passes its own size so a retro canvas draws in its pixels.
+void cf_draw_on_app_canvas_resized(int w, int h);
+
+// Called by cf_render_layers_to before the canvas (and its render pass) is applied: stages
+// every in-range untextured mesh command's instance data into one shared GPU instance buffer
+// in a single upload, so cf_draw3d_process never tears down the live render pass to upload.
+// Commands bind their slice via the instance-buffer override's byte offset.
+void cf_draw3d_prepare_uploads(int layer_lo, int layer_hi);
+
+// Called by cf_destroy_shader: destroys the hidden solid-variant sibling of a 3d shape
+// shader's canonical handle (see cf_make_draw3d_shape_shader). Returns false if the id is
+// not a shape shader.
+bool cf_draw3d_destroy_shape_shader_sibling(uint64_t shader_id);
+
+// Called by the shader-directory watcher: hot-reloads every 3d shape shader made from
+// `changed_key`, swapping fresh guts into both variants of each affected bundle.
+void cf_draw3d_reload_shape_shaders(const char* changed_key);
+// Draw-list hooks: list-local 3d transforms while recording; bake (grouping + exact normal
+// matrices) at end; replay payloads borrowing the baked instances under a live camera; and
+// payload cleanup when a list's commands are cleared or destroyed.
+void cf_draw3d_list_begin();
+void cf_draw3d_list_end(struct CF_DrawListData* data);
+// Atlas uv routing for sprite-textured meshes: the 2d batch callback calls this first; it
+// consumes the report when a mesh command is mid-resolution in cf_draw3d_process.
+bool cf_draw3d_atlas_report(atlas_cache_entry_t* entries, int count, int texture_w, int texture_h);
+// `prev` is the command directly under `dst` in its layer's queue when that command was
+// replayed from the same list during this replay, else NULL. Returns true when the source
+// command fused into `prev` instead of populating `dst` -- the caller then discards `dst`.
+bool cf_draw3d_replay_cmd(CF_Command* dst, CF_Command* prev, const CF_Command* src);
+// The 3d camera 2d Z maps through (cf_draw_push_z): fills `vp` with projection * view and
+// returns a nonzero id that changes whenever that matrix does, or returns 0 while no 3d
+// projection is pushed (2d Z then uses the default CF_DRAW_Z_RANGE).
+uint64_t cf_draw3d_depth_camera(CF_M4x4* vp);
+void cf_draw3d_free_list_cmds(struct CF_DrawListData* data);
+
+// We slice up a 64-bit int into lo + hi ranges to map where we can fetch pixels
+// from. This slices up the 64-bit range into 16 unique range. The ranges are inclusive.
+#define CF_IMAGE_ID_RANGE_SIZE   ((1ULL << 60) - 1)
+#define CF_ASEPRITE_ID_RANGE_LO  (0ULL)
+#define CF_ASEPRITE_ID_RANGE_HI  (CF_ASEPRITE_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_CUSTOM_SPRITE_ID_RANGE_LO (CF_ASEPRITE_ID_RANGE_HI + 1)
+#define CF_CUSTOM_SPRITE_ID_RANGE_HI (CF_CUSTOM_SPRITE_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_FONT_ID_RANGE_LO      (CF_CUSTOM_SPRITE_ID_RANGE_HI + 1)
+#define CF_FONT_ID_RANGE_HI      (CF_FONT_ID_RANGE_LO     + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_EASY_ID_RANGE_LO      (CF_FONT_ID_RANGE_HI     + 1)
+#define CF_EASY_ID_RANGE_HI      (CF_EASY_ID_RANGE_LO     + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_PREMADE_ID_RANGE_LO   (CF_EASY_ID_RANGE_HI     + 1)
+#define CF_PREMADE_ID_RANGE_HI   (CF_PREMADE_ID_RANGE_LO  + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_PATH_ID_RANGE_LO      (CF_PREMADE_ID_RANGE_HI  + 1)
+#define CF_PATH_ID_RANGE_HI      (CF_PATH_ID_RANGE_LO     + CF_IMAGE_ID_RANGE_SIZE)
+
+ATLAS_CACHE_U64 cf_generate_texture_handle(void* pixels, int w, int h, void* udata);
+void cf_destroy_texture_handle(ATLAS_CACHE_U64 texture_id, void* udata);
+atlas_cache_t* cf_get_draw_atlas_cache();
+
+#endif // CF_DRAW_INTERNAL_H

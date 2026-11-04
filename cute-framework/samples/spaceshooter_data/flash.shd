@@ -1,0 +1,4 @@
+vec4 shader(vec4 color, ShaderParams params)
+{
+	return vec4(mix(color.rgb, params.attributes.rgb, params.attributes.a), color.a);
+}

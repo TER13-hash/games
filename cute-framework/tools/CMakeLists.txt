@@ -1,0 +1,125 @@
+# The shader compiler front-end (cute_shader.cpp) builds directly into the cute
+# target. It sits on cute_spirv.h, CF's own GLSL -> SPIR-V compiler with
+# transpiler backends for HLSL/MSL/GLSL ES 300 -- no external dependencies.
+target_sources(cute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cute_shader.cpp)
+
+# The CF_RUNTIME_SHADER_COMPILATION macro stays defined for backwards
+# compatibility with user code using the documented #ifdef idiom.
+target_compile_definitions(cute PUBLIC CF_RUNTIME_SHADER_COMPILATION)
+
+# cute-spirv-tests, the compiler's unit test suite. Runs standalone (no SDL);
+# validates emitted modules with spirv-val when CSPV_SPIRV_VAL points at it.
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL "${CMAKE_SOURCE_DIR}/tools")
+	add_executable(cute-spirv-tests ${CMAKE_CURRENT_SOURCE_DIR}/cute_spirv_test.c)
+	set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/cute_spirv_test.c PROPERTIES LANGUAGE CXX)
+	target_include_directories(cute-spirv-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../libraries ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+	target_compile_definitions(cute-spirv-tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+	set_target_properties(cute-spirv-tests PROPERTIES FOLDER "tools")
+endif()
+
+# cute-model-fuzz, a mutation fuzzer for cute_model.h. Standalone (ckit only), so it
+# builds cleanly under a sanitizer:
+#     cl /TP /EHsc /fsanitize=address /Zi /Od /I libraries tools\cute_model_fuzz.c
+# See the file header for usage.
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL "${CMAKE_SOURCE_DIR}/tools")
+	add_executable(cute-model-fuzz ${CMAKE_CURRENT_SOURCE_DIR}/cute_model_fuzz.c)
+
+	# cute-jpg-fuzz, the same mutation-fuzzer treatment for cute_jpg.h. Standalone.
+	add_executable(cute-jpg-fuzz ${CMAKE_CURRENT_SOURCE_DIR}/cute_jpg_fuzz.c)
+	set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/cute_jpg_fuzz.c PROPERTIES LANGUAGE CXX)
+	target_include_directories(cute-jpg-fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libraries)
+	target_compile_definitions(cute-jpg-fuzz PRIVATE _CRT_SECURE_NO_WARNINGS)
+	set_target_properties(cute-jpg-fuzz PROPERTIES FOLDER "tools" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+	set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/cute_model_fuzz.c PROPERTIES LANGUAGE CXX)
+	target_include_directories(cute-model-fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libraries)
+	target_compile_definitions(cute-model-fuzz PRIVATE _CRT_SECURE_NO_WARNINGS)
+	set_target_properties(cute-model-fuzz PROPERTIES FOLDER "tools" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+	# The cute_h264.h harness. Standalone like the fuzzers above. cute-h264-test encodes synthetic
+	# patterns and cute-h264-decode decodes them back, which h264_bconf.py and h264_refconf.py
+	# drive against ffmpeg for bit-exact conformance sweeps; the fuzz targets feed damaged streams
+	# and containers (seed corpus: h264_fuzz_seed.264) and are meant to run under a sanitizer.
+	foreach(H264_TOOL test decode cabac-test mp4-test fuzz fuzz-one mp4-fuzz)
+		string(REPLACE "-" "_" H264_SRC ${H264_TOOL})
+		add_executable(cute-h264-${H264_TOOL} ${CMAKE_CURRENT_SOURCE_DIR}/h264_${H264_SRC}.c)
+		target_include_directories(cute-h264-${H264_TOOL} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libraries)
+		target_compile_definitions(cute-h264-${H264_TOOL} PRIVATE _CRT_SECURE_NO_WARNINGS)
+		set_target_properties(cute-h264-${H264_TOOL} PROPERTIES FOLDER "tools" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+		if (UNIX)
+			target_link_libraries(cute-h264-${H264_TOOL} PRIVATE m) # sin/cos in the test pattern
+		endif()
+	endforeach()
+endif()
+
+# cute-web-smoke, the page tools/web_smoke.py loads in Chrome to check the web build's backend
+# pick (WebGPU, or the WebGL 2 fallback) and a readback. Emscripten's default shell is enough.
+if (EMSCRIPTEN AND CF_WEBGPU AND CMAKE_CURRENT_SOURCE_DIR STREQUAL "${CMAKE_SOURCE_DIR}/tools")
+	add_executable(cute-web-smoke ${CMAKE_CURRENT_SOURCE_DIR}/web_smoke.c)
+	target_link_libraries(cute-web-smoke PRIVATE cute)
+	set_target_properties(cute-web-smoke PROPERTIES FOLDER "tools" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR} OUTPUT_NAME web_smoke SUFFIX ".html")
+	target_compile_options(cute-web-smoke PRIVATE -O1)
+	target_link_options(cute-web-smoke PRIVATE -O1)
+endif()
+
+# cute-sym, the crash reporter's symbol table tool (libraries/cute/cute_sym.h): reads a binary's
+# debug info (PDB, dSYM or debug map, ELF DWARF) into one `.sym` table, writes it beside the
+# binary or embeds it in the reserved slot, and resolves or prints reports. Plain C, no
+# dependencies; cf_symbols() in cmake/CuteSym.cmake runs it as a post-build step.
+if (CF_CUTE_SYM AND NOT EMSCRIPTEN AND NOT CMAKE_CROSSCOMPILING)
+	add_executable(cute-sym ${CMAKE_CURRENT_SOURCE_DIR}/cute_sym.c)
+	target_include_directories(cute-sym PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libraries)
+	target_compile_definitions(cute-sym PRIVATE _CRT_SECURE_NO_WARNINGS)
+	set_target_properties(cute-sym PROPERTIES FOLDER "tools" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
+
+# cute-shaderc, an offline shader compiler
+if (CF_CUTE_SHADERC)
+	set(CUTE_SHADERC_SRCS
+		${CMAKE_CURRENT_SOURCE_DIR}/cute_shaderc.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/cute_shader.cpp)
+	# Standalone tools need a ckit implementation TU (CF apps get it from the
+	# cute library's src/cute_ckit.cpp).
+	list(APPEND CUTE_SHADERC_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/cute_shader_ckit.cpp)
+	# ...and cf_alloc/cf_free themselves, so allocations go through the same
+	# knob as everywhere else in CF (CF apps get it from the cute library),
+	# plus the CF_ASSERT handler cute_alloc.cpp relies on.
+	list(APPEND CUTE_SHADERC_SRCS
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/cute_alloc.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/cute_shader_assert.cpp)
+	add_executable(cute-shaderc ${CUTE_SHADERC_SRCS})
+	target_include_directories(cute-shaderc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+	set_target_properties(cute-shaderc PROPERTIES FOLDER "tools")
+	if (EMSCRIPTEN)
+		# The tool is a build step, not a web page: it runs through node (the
+		# Emscripten toolchain's CMAKE_CROSSCOMPILING_EMULATOR, which CMake
+		# prepends when a custom command invokes this target). NODERAWFS maps
+		# the host filesystem so the input GLSL and output header paths work
+		# as-is, and EXIT_RUNTIME turns main's return into the process exit code.
+		target_link_options(cute-shaderc PRIVATE
+			-sENVIRONMENT=node
+			-sNODERAWFS=1
+			-sEXIT_RUNTIME=1
+			-sALLOW_MEMORY_GROWTH=1
+		)
+	endif()
+	install(TARGETS cute-shaderc
+	BUNDLE DESTINATION .
+	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+# docsparser, a standalone documentation generator (only depends on ckit.h)
+# Only build when CF is the top-level project (not when used as subdirectory)
+cmake_path(GET CMAKE_CURRENT_SOURCE_DIR PARENT_PATH CF_ROOT_DIR)
+if (CF_ROOT_DIR STREQUAL CMAKE_SOURCE_DIR OR CF_BUILD_DOCSPARSER)
+	add_executable(docsparser ${CMAKE_CURRENT_SOURCE_DIR}/docs_parser.c)
+	target_include_directories(docsparser PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libraries)
+	if(MSVC)
+		target_compile_options(docsparser PRIVATE /std:clatest /experimental:c11atomics)
+	endif()
+	set_target_properties(docsparser PROPERTIES
+		FOLDER "tools"
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+	)
+endif()

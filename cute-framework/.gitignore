@@ -1,0 +1,16 @@
+build*/
+docs/*/*.md
+docs/*/*/*.md
+!docs/samples/*.md
+docs/api_reference.md
+!docs/topics/*.md
+/docs/samples/play/
+site/
+.cache
+.DS_Store
+cute_framework.zip
+github_release
+imgui.ini
+src/cute_version.cpp
+include/cute_version.h
+compile_commands.json

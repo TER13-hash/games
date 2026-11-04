@@ -1,0 +1,39 @@
+/.project
+/bin
+/package
+/Cocos-Creator-API.json
+/declarations
+
+.turbo
+.idea
+.history
+.DS_Store
+
+lib
+build
+aspnet_client
+node_modules
+npm-debug.log
+DebugInfos.json
+playground/library
+tests/core/serialization/ccob-serialized-gallery
+scripts/build-engine/dist
+scripts/native-pack-tool/dist
+scripts/runtime-web-adapter
+scripts/typedoc-plugin/lib/
+native/external/
+editor/library/
+
+!templates/**/*
+templates/**/.DS_Store
+
+# pal 由 @cocos/engine-pal 在 postinstall 挂载(软链/复制)，不入库
+/pal
+
+# platforms 源码已抽到 @cocos/engine-platforms；其预打包 adapter 由 postinstall 的
+# spread-adapter.cjs 复制到 bin/adapter(/bin 已忽略)。platforms 源码不再入库。
+/platforms
+
+@types/consts.d.ts
+
+__TS_ENGINE__/

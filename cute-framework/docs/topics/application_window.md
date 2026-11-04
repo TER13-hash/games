@@ -1,0 +1,102 @@
+# Creating a Window
+
+Here's a good starting program to copy + paste. It creates a window in the center of the screen with dimensions 640x480 pixels. This snippet runs a typical game loop after window creation.
+
+```cpp
+#include <cute.h>
+
+int main(int argc, char* argv[])
+{
+	// Create a window with a resolution of 640 x 480.
+	CF_Result result = cf_make_app("Fancy Window Title", 0, 0, 0, 640, 480, CF_APP_OPTIONS_WINDOW_POS_CENTERED_BIT, argv[0]);
+	if (is_error(result)) {
+		printf("Error: %s\n", result.details);
+		return -1;
+	}
+
+	while (cf_app_is_running())
+	{
+		cf_app_update(NULL);
+		// All your game logic and updates go here...
+		cf_app_draw_onto_screen();
+	}
+
+	cf_destroy_app();
+
+	return 0;
+}
+```
+
+Now is a good time to check out the [App Options](../app/enum/cf_appoptionflagbits.md) page to see what kind of windows are available. This covers things like letting the window resize, what kind of graphics context to initialize, whether or not audio is enabled, etc.
+
+## Gathering Input
+
+You have access to inputs from the keyboard, mouse, joypad, touch, and [IME inputs](https://learn.microsoft.com/en-us/windows/apps/design/input/input-method-editors). For more in-depth reading about input, see the [Input](../topics/input.md) page.
+
+Gather keyboard inputs by calling [`cf_key_down`](../input/function/cf_key_down.md) or [`cf_mouse_down`](../input/function/cf_mouse_down.md). These will return true for as long as the corresponding key is down. You may gather input after calling [`cf_app_update`](../app/function/cf_app_update.md).
+
+Here is a basic demonstration of capturing keyboard and mouse inputs.
+
+```cpp
+#include <cute.h>
+#include <stdio.h>
+
+int main(int argc, char* argv[])
+{
+	CF_Result result = cf_make_app("Input", 0, 0, 0, 640, 480, CF_APP_OPTIONS_WINDOW_POS_CENTERED_BIT, argv[0]);
+	if (cf_is_error(result)) return -1;
+
+	while (cf_app_is_running())
+	{
+		cf_app_update(NULL);
+		
+		// Test for keyboard input.
+		if (cf_key_down(CF_KEY_Z)) {
+			printf("Key Z is currently DOWN\n");
+		}
+		
+		// Test for mouse input.
+		if (cf_mouse_down(CF_MOUSE_BUTTON_LEFT)) {
+			printf("Mouse left is currently DOWN\n");
+		}
+		
+		// Showcase the "just pressed" API for keyboard/mouse.
+		if (cf_key_just_pressed(CF_KEY_X)) {
+			printf("Key X was just pressed\n");
+		}
+		if (cf_mouse_just_pressed(CF_MOUSE_BUTTON_RIGHT)) {
+			printf("Mouse right is currently DOWN\n");
+		}
+		
+		cf_app_draw_onto_screen();
+	}
+
+	cf_destroy_app();
+
+	return 0;
+}
+```
+
+## Window Events
+
+The window can undergo a few different events such as resizing, moving, minimizing, etc. To know when one of these events occurs simply call one of the associated functions to fetch the state of the event.
+
+> Listening and tracing window resize events.
+
+```cpp
+if (cf_app_gained_focus()) {
+	printf("App gained focus.\n");
+}
+if (cf_app_lost_focus()) {
+	printf("App has lost focus.\n");
+}
+```
+
+For a full demonstration you can check out the sample on [Window Events](https://github.com/RandyGaul/cute_framework/blob/master/samples/window_events.c).
+
+
+## Resizing Windows
+
+If you've already learned about [Low Level Graphics](../topics/low_level_graphics.md) this section will make more sense. The application has its own internal canvas. A canvas is a graphical texture the application can render upon. The app's built-in canvas automatically gathers up all drawings from [`cute_draw.h`](../api_reference.md#draw) and displays them onto the screen. The canvas tracks the window automatically: it's recreated at `window_size * pixel_scale` whenever the window is resized or moves to a display with a different pixel density (see [High-DPI Rendering](../topics/hidpi.md)). [`cf_app_set_canvas_size`](../app/function/cf_app_set_canvas_size.md) can override the size as a one-shot, lasting until the next such recreation.
+
+Check out the samples on [Window Resizing](https://github.com/RandyGaul/cute_framework/blob/master/samples/window_resizing.cpp) and [Canvas Modes](https://github.com/RandyGaul/cute_framework/blob/master/samples/canvas_modes.c) for full examples of scaling a fixed-resolution game canvas up to the window.

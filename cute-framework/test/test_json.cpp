@@ -1,0 +1,276 @@
+/*
+	Cute Framework
+	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
+
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
+*/
+
+#include "test_harness.h"
+
+#include <cute.h>
+
+using namespace Cute;
+
+TEST_CASE(test_json_basic)
+{
+	CF_JDoc doc = cf_make_json(NULL, 0);
+	CF_JVal root = cf_json_object(doc);
+	cf_json_set_root(doc, root);
+
+	cf_json_object_add_float(doc, root, "x", 1.0f);
+	cf_json_object_add_float(doc, root, "y", 2.0f);
+	cf_json_object_add_float(doc, root, "z", 3.0f);
+
+	char* s0 = cf_json_to_string(doc);
+	const char* s1 = 
+		"{\n"
+		"\t\"x\": 1.0,\n"
+		"\t\"y\": 2.0,\n"
+		"\t\"z\": 3.0\n"
+		"}"
+	;
+
+	REQUIRE(!CF_STRCMP(s0, s1));
+	sfree(s0);
+	cf_destroy_json(doc);
+
+	return true;
+}
+
+TEST_CASE(test_json_basic_cpp)
+{
+	JDoc doc = JDoc::make();
+	JVal root = doc.alloc_object();
+	doc.set_root(root);
+
+	root.add("x", 1.0f);
+	root.add("y", 2.0f);
+	root.add("z", 3.0f);
+
+	String s0 = doc.to_string();
+	const char* s1 = 
+		"{\n"
+		"\t\"x\": 1.0,\n"
+		"\t\"y\": 2.0,\n"
+		"\t\"z\": 3.0\n"
+		"}"
+	;
+
+	REQUIRE(!CF_STRCMP(s0, s1));
+	doc.destroy();
+
+	return true;
+}
+
+TEST_CASE(test_json_nested_objects)
+{
+	const char* s = 
+		"{\n"
+		"\t\"pos\": {\n"
+		"\t\t\"x\": 10.0,\n"
+		"\t\t\"y\": -5.0,\n"
+		"\t},\n"
+		"\t\"normal\": {\n"
+		"\t\t\"x\": 1.0,\n"
+		"\t\t\"y\": 0.0,\n"
+		"\t},\n"
+		"}"
+	;
+	CF_JDoc doc = cf_make_json(s, CF_STRLEN(s));
+	CF_JVal root = cf_json_get_root(doc);
+
+	CF_JIter iter = cf_json_iter(root);
+	auto read_v2 = [&](const char* key) -> v2 {
+		CF_JVal val = cf_json_iter_next_by_name(&iter, key);
+		CF_JIter i = cf_json_iter(val);
+		float x = cf_json_get_float(cf_json_iter_next_by_name(&i, "x"));
+		float y = cf_json_get_float(cf_json_iter_next_by_name(&i, "y"));
+		return V2(x,y);
+	};
+
+	v2 pos = read_v2("pos");
+	v2 normal = read_v2("normal");
+	REQUIRE(pos.x == 10.0f);
+	REQUIRE(pos.y == -5.0f);
+	REQUIRE(normal.x == 1.0f);
+	REQUIRE(normal.y == 0.0f);
+
+	cf_destroy_json(doc);
+
+	return true;
+}
+
+TEST_CASE(test_json_array)
+{
+	CF_JDoc doc = cf_make_json(NULL, 0);
+	CF_JVal root = cf_json_object(doc);
+	cf_json_set_root(doc, root);
+
+	CF_JVal words = cf_json_array(doc);
+	cf_json_array_add_string(doc, words, "hello");
+	cf_json_array_add_string(doc, words, "goodbye");
+	cf_json_array_add_string(doc, words, "saturday");
+	cf_json_object_add(doc, root, "words", words);
+
+	for (CF_JIter iter = cf_json_iter(words); !cf_json_iter_done(iter); iter = cf_json_iter_next(iter)) {
+		const char* val = cf_json_get_string(cf_json_iter_val(iter));
+		if (iter.index == 0) {
+			REQUIRE(!CF_STRCMP(val, "hello"));
+		} else if (iter.index == 1) {
+			REQUIRE(!CF_STRCMP(val, "goodbye"));
+		} else {
+			REQUIRE(!CF_STRCMP(val, "saturday"));
+		}
+	}
+
+	char* s0 = cf_json_to_string(doc);
+	const char* s1 =
+		"{\n"
+		"\t\"words\": [\n"
+		"\t\t\"hello\",\n"
+		"\t\t\"goodbye\",\n"
+		"\t\t\"saturday\"\n"
+		"\t]\n"
+		"}"
+	;
+	REQUIRE(!CF_STRCMP(s0, s1));
+	sfree(s0);
+	cf_destroy_json(doc);
+
+	return true;
+}
+
+TEST_CASE(test_json_array_cpp)
+{
+	JDoc doc = JDoc::make();
+	JVal root = doc.alloc_object();
+	doc.set_root(root);
+
+	JVal words = doc.alloc_array();
+	words.add("hello");
+	words.add("goodbye");
+	words.add("saturday");
+	root.add("words", words);
+
+	for (JIter iter = words.iter(); !iter.done(); iter = iter.next()) {
+		const char* val = iter.val().get_string();
+		if (iter.index() == 0) {
+			REQUIRE(!CF_STRCMP(val, "hello"));
+		} else if (iter.index() == 1) {
+			REQUIRE(!CF_STRCMP(val, "goodbye"));
+		} else {
+			REQUIRE(!CF_STRCMP(val, "saturday"));
+		}
+	}
+
+	String s0 = doc.to_string();
+	const char* s1 =
+		"{\n"
+		"\t\"words\": [\n"
+		"\t\t\"hello\",\n"
+		"\t\t\"goodbye\",\n"
+		"\t\t\"saturday\"\n"
+		"\t]\n"
+		"}"
+	;
+	REQUIRE(!CF_STRCMP(s0, s1));
+	doc.destroy();
+
+	return true;
+}
+
+TEST_CASE(test_json_iterate_object)
+{
+	CF_JDoc doc = cf_make_json(NULL, 0);
+	CF_JVal root = cf_json_object(doc);
+	cf_json_set_root(doc, root);
+
+	cf_json_object_add_float(doc, root, "x", 1.0f);
+	cf_json_object_add_float(doc, root, "y", 2.0f);
+	cf_json_object_add_float(doc, root, "z", 3.0f);
+
+	for (CF_JIter iter = cf_json_iter(root); !cf_json_iter_done(iter); iter = cf_json_iter_next(iter)) {
+		const char* key = cf_json_iter_key(iter);
+		float val = cf_json_get_float(cf_json_iter_val(iter));
+		if (iter.index == 0) {
+			REQUIRE(!CF_STRCMP(key, "x"));
+			REQUIRE(val == 1.0f);
+		} else if (iter.index == 1) {
+			REQUIRE(!CF_STRCMP(key, "y"));
+			REQUIRE(val == 2.0f);
+		} else {
+			REQUIRE(!CF_STRCMP(key, "z"));
+			REQUIRE(val == 3.0f);
+		}
+	}
+
+	cf_destroy_json(doc);
+
+	return true;
+}
+
+TEST_CASE(test_json_iterate_object_cpp)
+{
+	JDoc doc = JDoc::make();
+	JVal root = doc.alloc_object();
+	doc.set_root(root);
+
+	root.add("x", 1.0f);
+	root.add("y", 2.0f);
+	root.add("z", 3.0f);
+
+	for (JIter iter = root.iter(); !iter.done(); iter = iter.next()) {
+		const char* key = iter.key();
+		float val = iter.val().get_float();
+		if (iter.index() == 0) {
+			REQUIRE(!CF_STRCMP(key, "x"));
+			REQUIRE(val == 1.0f);
+		} else if (iter.index() == 1) {
+			REQUIRE(!CF_STRCMP(key, "y"));
+			REQUIRE(val == 2.0f);
+		} else {
+			REQUIRE(!CF_STRCMP(key, "z"));
+			REQUIRE(val == 3.0f);
+		}
+	}
+
+	doc.destroy();
+
+	return true;
+}
+
+TEST_CASE(test_json_numeric)
+{
+	const char* s =
+			"{\n"
+			"\t\"health\": 100,\n"
+			"\t\"speed\": 50.0,\n"
+			"\t\"is_cute\": 1\n"
+			"}"
+	;
+	CF_JDoc doc = cf_make_json(s, CF_STRLEN(s));
+	CF_JVal root = cf_json_get_root(doc);
+	float health = cf_json_get_float(cf_json_get(root, "health"));
+	int speed = cf_json_get_int(cf_json_get(root, "speed"));
+	bool is_cute = cf_json_get_bool(cf_json_get(root, "is_cute"));
+
+	REQUIRE(health == 100.f);
+	REQUIRE(speed == 50);
+	REQUIRE(is_cute == true);
+
+	cf_destroy_json(doc);
+
+	return true;
+}
+
+TEST_SUITE(test_json)
+{
+	RUN_TEST_CASE(test_json_basic);
+	RUN_TEST_CASE(test_json_basic_cpp);
+	RUN_TEST_CASE(test_json_nested_objects);
+	RUN_TEST_CASE(test_json_array);
+	RUN_TEST_CASE(test_json_array_cpp);
+	RUN_TEST_CASE(test_json_iterate_object);
+	RUN_TEST_CASE(test_json_iterate_object_cpp);
+	RUN_TEST_CASE(test_json_numeric);
+}

@@ -1,0 +1,3651 @@
+#include "internal/cute_graphics_internal.h"
+#include "internal/cute_app_internal.h"
+#include "internal/cute_alloc_internal.h"
+
+#include <cute_graphics.h>
+#include <cute_time.h>
+
+#ifdef CF_EMSCRIPTEN
+#	include <GLES3/gl3.h>
+#	include <GLES3/gl2ext.h>
+#else
+#	include <glad/glad.h>
+#endif
+
+// GLES 3.0 has anisotropic filtering only as GL_EXT_texture_filter_anisotropic. Neither
+// glad's ES loader nor every GLES3 header set defines its enums, so spell them out.
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#	define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#	define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
+#define CF_POLL_OPENGL_ERROR() \
+	do { \
+		if (g_ctx.debug) { s_poll_error(__FILE__, __LINE__); } \
+	} while (0)
+
+static inline GLenum s_wrap(CF_Filter f)
+{
+	switch (f) { default:
+	case CF_FILTER_NEAREST: return GL_NEAREST;
+	case CF_FILTER_LINEAR:  return GL_LINEAR;
+	}
+}
+
+static inline GLenum s_wrap(CF_MipFilter m, bool has_mips)
+{
+	switch (m) { default:
+	case CF_MIP_FILTER_NEAREST: return has_mips ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST;
+	case CF_MIP_FILTER_LINEAR:  return has_mips ? GL_LINEAR_MIPMAP_LINEAR   : GL_LINEAR;
+	}
+}
+
+static inline GLenum s_wrap(CF_WrapMode w)
+{
+	switch (w) { default:
+	case CF_WRAP_MODE_CLAMP_TO_EDGE:   return GL_CLAMP_TO_EDGE;
+	case CF_WRAP_MODE_REPEAT:          return GL_REPEAT;
+	case CF_WRAP_MODE_MIRRORED_REPEAT: return GL_MIRRORED_REPEAT;
+	}
+}
+
+static inline GLenum s_wrap(CF_PrimitiveType p)
+{
+	switch (p) { default:
+	case CF_PRIMITIVE_TYPE_TRIANGLELIST:  return GL_TRIANGLES;
+	case CF_PRIMITIVE_TYPE_TRIANGLESTRIP: return GL_TRIANGLE_STRIP;
+	case CF_PRIMITIVE_TYPE_LINELIST:      return GL_LINES;
+	case CF_PRIMITIVE_TYPE_LINESTRIP:     return GL_LINE_STRIP;
+	}
+}
+
+static inline GLenum s_wrap(CF_CompareFunction c)
+{
+	switch (c) { default:
+	case CF_COMPARE_FUNCTION_ALWAYS:                return GL_ALWAYS;
+	case CF_COMPARE_FUNCTION_NEVER:                 return GL_NEVER;
+	case CF_COMPARE_FUNCTION_LESS_THAN:             return GL_LESS;
+	case CF_COMPARE_FUNCTION_EQUAL:                 return GL_EQUAL;
+	case CF_COMPARE_FUNCTION_NOT_EQUAL:             return GL_NOTEQUAL;
+	case CF_COMPARE_FUNCTION_LESS_THAN_OR_EQUAL:    return GL_LEQUAL;
+	case CF_COMPARE_FUNCTION_GREATER_THAN:          return GL_GREATER;
+	case CF_COMPARE_FUNCTION_GREATER_THAN_OR_EQUAL: return GL_GEQUAL;
+	}
+}
+
+static inline GLenum s_wrap(CF_CullMode m)
+{
+	switch (m) { default:
+	case CF_CULL_MODE_NONE:  return 0;
+	case CF_CULL_MODE_FRONT: return GL_FRONT;
+	case CF_CULL_MODE_BACK:  return GL_BACK;
+	}
+}
+
+static inline GLenum s_wrap(CF_BlendOp op)
+{
+	switch (op) { default:
+	case CF_BLEND_OP_ADD:              return GL_FUNC_ADD;
+	case CF_BLEND_OP_SUBTRACT:         return GL_FUNC_SUBTRACT;
+	case CF_BLEND_OP_REVERSE_SUBTRACT: return GL_FUNC_REVERSE_SUBTRACT;
+	case CF_BLEND_OP_MIN:              return GL_MIN;
+	case CF_BLEND_OP_MAX:              return GL_MAX;
+	}
+}
+
+static inline GLenum s_wrap(CF_BlendFactor f)
+{
+	switch (f) { default:
+	case CF_BLENDFACTOR_ZERO:                     return GL_ZERO;
+	case CF_BLENDFACTOR_ONE:                      return GL_ONE;
+	case CF_BLENDFACTOR_SRC_COLOR:                return GL_SRC_COLOR;
+	case CF_BLENDFACTOR_ONE_MINUS_SRC_COLOR:      return GL_ONE_MINUS_SRC_COLOR;
+	case CF_BLENDFACTOR_DST_COLOR:                return GL_DST_COLOR;
+	case CF_BLENDFACTOR_ONE_MINUS_DST_COLOR:      return GL_ONE_MINUS_DST_COLOR;
+	case CF_BLENDFACTOR_SRC_ALPHA:                return GL_SRC_ALPHA;
+	case CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA:      return GL_ONE_MINUS_SRC_ALPHA;
+	case CF_BLENDFACTOR_DST_ALPHA:                return GL_DST_ALPHA;
+	case CF_BLENDFACTOR_ONE_MINUS_DST_ALPHA:      return GL_ONE_MINUS_DST_ALPHA;
+	case CF_BLENDFACTOR_CONSTANT_COLOR:           return GL_CONSTANT_COLOR;
+	case CF_BLENDFACTOR_ONE_MINUS_CONSTANT_COLOR: return GL_ONE_MINUS_CONSTANT_COLOR;
+	case CF_BLENDFACTOR_SRC_ALPHA_SATURATE:       return GL_SRC_ALPHA_SATURATE;
+	}
+}
+
+static inline GLenum s_wrap(CF_StencilOp op)
+{
+	switch (op) { default:
+	case CF_STENCIL_OP_KEEP:            return GL_KEEP;
+	case CF_STENCIL_OP_ZERO:            return GL_ZERO;
+	case CF_STENCIL_OP_REPLACE:         return GL_REPLACE;
+	case CF_STENCIL_OP_INCREMENT_CLAMP: return GL_INCR;
+	case CF_STENCIL_OP_DECREMENT_CLAMP: return GL_DECR;
+	case CF_STENCIL_OP_INVERT:          return GL_INVERT;
+	case CF_STENCIL_OP_INCREMENT_WRAP:  return GL_INCR_WRAP;
+	case CF_STENCIL_OP_DECREMENT_WRAP:  return GL_DECR_WRAP;
+	}
+}
+
+#define RING_BUFFER_CAPACITY 3
+#define CF_GLES_STORAGE_TEXTURE_RESERVE 8
+
+struct CF_GL_PixelFormatInfo
+{
+	CF_PixelFormat format;
+	GLenum internal_fmt;
+	GLenum upload_fmt;
+	GLenum upload_type;
+	uint32_t caps;
+	bool has_alpha;
+	bool is_depth;
+	bool has_stencil;
+	bool is_integer;
+	const char* required_extension;
+};
+
+struct CF_GL_Slot
+{
+	GLuint handle = 0;
+	GLsync fence = 0;           // Emergency mid-frame fence only (ring exhausted within one frame).
+	uint32_t in_flight_frame = 0; // Last frame this slot was drawn from; covered by the frame fence ring.
+	uint32_t last_use_frame = 0;
+	GLsizeiptr offset = 0;
+	GLsizeiptr size = 0;
+};
+
+struct CF_GL_Ring
+{
+	CF_GL_Slot slots[RING_BUFFER_CAPACITY];
+	int count = 0;
+	int head = 0;
+};
+
+struct CF_GL_Texture
+{
+	int w = 0, h = 0;
+	GLuint id = 0;
+	GLenum internal_fmt = GL_NONE;
+	GLenum upload_fmt   = GL_NONE;
+	GLenum upload_type  = GL_NONE;
+	bool has_mips = false;
+	int mip_count = 0; // 0 = full chain; otherwise an explicit partial chain length (CF_TextureParams::mip_count).
+	GLint min_filter = GL_LINEAR;
+	GLint mag_filter = GL_LINEAR;
+	GLint wrap_u = GL_REPEAT;
+	GLint wrap_v = GL_REPEAT;
+	float max_anisotropy = 1.0f;
+	GLuint draw_samplers[2] = {};
+	GLenum target = GL_TEXTURE_2D; // GL_TEXTURE_CUBE_MAP / GL_TEXTURE_3D / GL_TEXTURE_2D_ARRAY.
+	int layers = 1;                // Array layers, 3D depth, or 6 for cube maps.
+	bool compare = false;          // Comparison (shadow) sampling.
+	GLenum compare_func = GL_LEQUAL;
+	CF_GL_Ring ring;
+	int active_slot = -1;
+};
+
+struct CF_GL_Canvas
+{
+	int w, h;
+	GLuint fbo;
+	GLuint color;
+	GLuint depth;
+	bool has_depth;
+	bool has_stencil;
+	GLenum depth_internal_fmt;
+
+	// Rendering into a face/layer of a user-owned texture; the canvas does not own it.
+	bool attached;
+	// Depth-format attach targets become the canvas's DEPTH attachment instead (shadow
+	// cubes): no color side, draw buffer GL_NONE.
+	bool attached_depth;
+
+	// Depth as a sampleable texture instead of a renderbuffer, used when the canvas's
+	// depth target requests SAMPLER usage (shadow maps). Zero id when the renderbuffer
+	// path is in use. For attached_depth it is the borrowed attach target: not owned, and
+	// already attached at its face/layer/mip.
+	CF_Texture cf_depth;
+
+	// Additional color targets for MRT ([0] unused -- `color`/`cf_color` are target 0).
+	int target_count;
+	GLuint colors_mrt[CF_MAX_CANVAS_TARGETS];
+	CF_Texture cf_colors_mrt[CF_MAX_CANVAS_TARGETS];
+
+	// Per-canvas clear overrides; unset means fall back to the globals. Indexed per color target.
+	bool has_clear_color[CF_MAX_CANVAS_TARGETS];
+	CF_Color clear_color[CF_MAX_CANVAS_TARGETS];
+	bool has_clear_depth_stencil;
+	float clear_depth;
+	uint32_t clear_stencil;
+
+	CF_Texture cf_color;
+};
+
+struct CF_GL_Buffer
+{
+	GLuint id = 0;
+	GLenum target = GL_ARRAY_BUFFER;
+	GLsizeiptr capacity = 0;
+	GLintptr active_offset = 0;
+	int stride = 0;
+	int count = 0;
+	int active_slot = -1;
+	uint32_t version = 0;
+	CF_GL_Ring ring;
+};
+
+struct CF_GL_Mesh
+{
+	CF_GL_Buffer vbo;
+	CF_GL_Buffer ibo;
+	CF_GL_Buffer instance;
+
+	int attribute_count = 0;
+	CF_VertexAttribute attributes[CF_MESH_MAX_VERTEX_ATTRIBUTES];
+	// True once the draw3d layer has appended its reserved instance attributes and installed
+	// its own instance buffer. Lives on the mesh (not in the draw layer) so a destroyed handle
+	// reused for a new mesh can never inherit a stale classification.
+	bool draw3d_augmented = false;
+
+	// glGetAttribLocation results for the last shader this mesh drew with -- a per-attribute
+	// driver string lookup otherwise paid on every draw. Keyed on the shader's generation
+	// (never recycled, unlike program ids); appending attributes resets the key.
+	uint64_t attrib_cache_generation = 0;
+	GLint attrib_locs[CF_MESH_MAX_VERTEX_ATTRIBUTES];
+};
+
+struct CF_GL_ShaderUniformBlock
+{
+	CF_ShaderUniformInfo info;
+	CF_ShaderUniformMemberInfo* members;
+};
+
+struct CF_GL_ShaderInfo
+{
+	int num_uniform_blocks;
+	GLuint ubo[CF_MAX_UNIFORM_BLOCK_COUNT];
+	CF_GL_ShaderUniformBlock uniform_blocks[CF_MAX_UNIFORM_BLOCK_COUNT];
+	CF_ShaderUniformMemberInfo* uniform_members;
+};
+
+struct CF_GL_TextureBinding
+{
+	const char* name;
+	int location;
+};
+
+struct CF_GL_Shader
+{
+	GLuint program;
+
+	// Bit per attrib location (< 64): set when the shader-side input is an integer type
+	// (ivec/uvec), which must bind through glVertexAttribIPointer -- the float path would
+	// int-to-float convert and the shader would read garbage bits. Built once at link.
+	uint64_t integer_attrib_mask;
+
+	// Unique per shader object, never recycled (GL program ids are): meshes key their
+	// attribute-location caches on this so a stale cache can't survive program-id reuse.
+	uint64_t generation;
+
+	int num_texture_bindings;
+	CF_GL_TextureBinding* texture_bindings;
+	int num_vs_texture_bindings;
+	CF_GL_TextureBinding* vs_texture_bindings;
+	CF_GL_ShaderInfo vs;
+	CF_GL_ShaderInfo fs;
+};
+
+struct CF_GL_Rect
+{
+	int x, y, w, h;
+};
+
+struct CF_GL_RenderState
+{
+	CF_GL_Rect viewport;
+	bool scissor_enabled;
+	CF_GL_Rect scissor;
+	CF_Color blend_constants;
+	GLint stencil_reference;
+};
+
+enum
+{
+	CF_GL_FMT_CAP_SAMPLE = 0x1,
+	CF_GL_FMT_CAP_LINEAR = 0x2,
+	CF_GL_FMT_CAP_COLOR = 0x4,
+	CF_GL_FMT_CAP_ALPHA = 0x8,
+	CF_GL_FMT_CAP_MSAA = 0x10,
+	CF_GL_FMT_CAP_DEPTH = 0x20,
+	CF_GL_FMT_CAP_STENCIL = 0x40,
+};
+
+#ifdef CF_EMSCRIPTEN
+#	define GL_BGRA GL_BGRA_EXT
+	// These are not available in WebGL
+#	define GL_R16_SNORM GL_NONE
+#	define GL_RG16_SNORM GL_NONE
+#	define GL_RGBA16_SNORM GL_NONE
+#endif
+
+static CF_GL_PixelFormatInfo g_gl_pixel_formats[] =
+{
+	{ CF_PIXEL_FORMAT_A8_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8_UNORM, GL_R8, GL_RED, GL_UNSIGNED_BYTE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8G8_UNORM, GL_RG8, GL_RG, GL_UNSIGNED_BYTE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8G8B8A8_UNORM, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16B16A16_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R10G10B10A2_UNORM, GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_B5G6R5_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_B5G5R5A1_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_B4G4R4A4_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_B8G8R8A8_UNORM, GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, 0, true, false, false, false, "GL_EXT_texture_format_BGRA8888" },
+	{ CF_PIXEL_FORMAT_BC1_RGBA_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC2_RGBA_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC3_RGBA_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC4_R_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC5_RG_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC7_RGBA_UNORM, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC6H_RGB_FLOAT, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC6H_RGB_UFLOAT, GL_NONE, GL_NONE, GL_NONE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8_SNORM, GL_R8_SNORM, GL_RED, GL_BYTE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8G8_SNORM, GL_RG8_SNORM, GL_RG, GL_BYTE, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8G8B8A8_SNORM, GL_RGBA8_SNORM, GL_RGBA, GL_BYTE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16_SNORM, GL_R16_SNORM, GL_RED, GL_SHORT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16_SNORM, GL_RG16_SNORM, GL_RG, GL_SHORT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16B16A16_SNORM, GL_RGBA16_SNORM, GL_RGBA, GL_SHORT, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16_FLOAT, GL_R16F, GL_RED, GL_HALF_FLOAT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16_FLOAT, GL_RG16F, GL_RG, GL_HALF_FLOAT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R16G16B16A16_FLOAT, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R32_FLOAT, GL_R32F, GL_RED, GL_FLOAT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R32G32_FLOAT, GL_RG32F, GL_RG, GL_FLOAT, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R32G32B32A32_FLOAT, GL_RGBA32F, GL_RGBA, GL_FLOAT, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R11G11B10_UFLOAT, GL_R11F_G11F_B10F, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, 0, false, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_R8_UINT, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8G8_UINT, GL_RG8UI, GL_RG_INTEGER, GL_UNSIGNED_BYTE, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8G8B8A8_UINT, GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, 0, true, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16_UINT, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16G16_UINT, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16G16B16A16_UINT, GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, 0, true, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8_INT, GL_R8I, GL_RED_INTEGER, GL_BYTE, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8G8_INT, GL_RG8I, GL_RG_INTEGER, GL_BYTE, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8G8B8A8_INT, GL_RGBA8I, GL_RGBA_INTEGER, GL_BYTE, 0, true, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16_INT, GL_R16I, GL_RED_INTEGER, GL_SHORT, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16G16_INT, GL_RG16I, GL_RG_INTEGER, GL_SHORT, 0, false, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R16G16B16A16_INT, GL_RGBA16I, GL_RGBA_INTEGER, GL_SHORT, 0, true, false, false, true, NULL },
+	{ CF_PIXEL_FORMAT_R8G8B8A8_UNORM_SRGB, GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_B8G8R8A8_UNORM_SRGB, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC1_RGBA_UNORM_SRGB, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC2_RGBA_UNORM_SRGB, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC3_RGBA_UNORM_SRGB, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_BC7_RGBA_UNORM_SRGB, GL_NONE, GL_NONE, GL_NONE, 0, true, false, false, false, NULL },
+	{ CF_PIXEL_FORMAT_D16_UNORM, GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0, false, true, false, false, NULL },
+	{ CF_PIXEL_FORMAT_D24_UNORM, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0, false, true, false, false, NULL },
+	{ CF_PIXEL_FORMAT_D32_FLOAT, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, 0, false, true, false, false, NULL },
+	{ CF_PIXEL_FORMAT_D24_UNORM_S8_UINT, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, false, true, true, false, NULL },
+#if defined(GL_DEPTH32F_STENCIL8)
+	{ CF_PIXEL_FORMAT_D32_FLOAT_S8_UINT, GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0, false, true, true, false, NULL },
+#else
+	{ CF_PIXEL_FORMAT_D32_FLOAT_S8_UINT, GL_NONE, GL_NONE, GL_NONE, 0, false, true, true, false, NULL },
+#endif
+};
+
+static struct
+{
+	bool debug;
+	SDL_GLContext gl_ctx;
+	SDL_Window* window;
+	uint32_t frame_index;
+
+	// Cached query result
+	float anisotropy_limit;  // > 1.0 when anisotropic filtering is supported
+
+	CF_GL_RenderState target_state;
+	CF_GL_RenderState current_state;
+	GLuint fbo;
+	// Lazily-created scratch framebuffer used as a read source for texture->texture
+	// region copies (cf_gles_texture_copy_region). Owned by the current GL context.
+	GLuint scratch_read_fbo;
+	CF_MaterialInternal* material;
+	CF_GL_Shader* shader; // Last applied; range draws rebind attributes against it.
+	CF_GL_Mesh* mesh;
+	CF_GL_Canvas* canvas;
+	uint64_t enabled_vertex_attrib_mask;
+	CF_Filter filter_override;
+	bool has_filter_override;
+	GLint max_combined_texture_units; // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, queried once.
+	int max_canvas_targets; // min(GL_MAX_DRAW_BUFFERS, GL_MAX_COLOR_ATTACHMENTS, CF_MAX_CANVAS_TARGETS), queried once.
+
+	// One fence per FRAME covers every streaming slot used that frame (GL completes in order,
+	// so any signaled fence from frame >= N proves frame N's reads finished). This replaces the
+	// old fence-per-draw scheme, which drowned WebGL in fenceSync/glFlush calls.
+	GLsync frame_fences[4];
+	uint32_t frame_fence_frames[4];
+	bool frame_fence_done[4];
+
+	// Shadowed GL state, to skip redundant per-draw calls: on WebGL every GL call crosses to
+	// the GPU process, and re-specifying identical vertex attributes per draw dominated whole
+	// frames. Entries are forgotten when their buffer id is deleted (ids recycle).
+	struct
+	{
+		GLuint buf;
+		GLintptr ptr;
+		GLsizei stride;
+		GLenum type;
+		uint8_t comps;
+		uint8_t norm;
+		uint8_t integer;
+		uint8_t divisor;
+	} attrib_shadow[64];
+	GLuint bound_array_buffer;
+	GLuint bound_element_buffer;
+} g_ctx = { };
+
+static inline void s_bind_array_buffer(GLuint id)
+{
+	if (g_ctx.bound_array_buffer != id) {
+		glBindBuffer(GL_ARRAY_BUFFER, id);
+		g_ctx.bound_array_buffer = id;
+	}
+}
+
+static inline void s_bind_element_buffer(GLuint id)
+{
+	if (g_ctx.bound_element_buffer != id) {
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, id);
+		g_ctx.bound_element_buffer = id;
+	}
+}
+
+// Call before glDeleteBuffers: GL detaches deleted buffers from context state and recycles ids,
+// so any shadow entry naming this id is a lie afterward.
+static inline void s_forget_buffer(GLuint id)
+{
+	if (!id) return;
+	if (g_ctx.bound_array_buffer == id) g_ctx.bound_array_buffer = 0;
+	if (g_ctx.bound_element_buffer == id) g_ctx.bound_element_buffer = 0;
+	for (int i = 0; i < 64; ++i) {
+		if (g_ctx.attrib_shadow[i].buf != id) continue;
+		// The divisor is per-index context state, untouched by buffer deletion -- clearing
+		// its shadow here would desync it (a skipped divisor call on stale-but-correct
+		// shadow state is how instanced garbage sneaks into per-vertex draws).
+		uint8_t divisor = g_ctx.attrib_shadow[i].divisor;
+		g_ctx.attrib_shadow[i] = { };
+		g_ctx.attrib_shadow[i].divisor = divisor;
+	}
+}
+
+static inline void s_poll_error(const char* file, int line)
+{
+	GLenum err;
+	while ((err = glGetError()) != GL_NO_ERROR) {
+		fprintf(stderr, "%s:%d: GL error: 0x%x\n", file, line, err);
+	}
+}
+
+static inline GLsizeiptr s_align_up(GLsizeiptr value, GLsizeiptr alignment)
+{
+	GLsizeiptr mask = alignment - 1;
+	return (value + mask) & ~mask;
+}
+
+static inline GLenum s_poll_fence(GLsync fence)
+{
+	if (!fence) return GL_ALREADY_SIGNALED;
+	return glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+}
+
+// True once the GPU can no longer be reading the slot: its emergency fence (if any) signaled,
+// or any frame fence at or past its in-flight frame signaled.
+static inline bool s_slot_ready(CF_GL_Slot& slot)
+{
+	if (slot.fence) {
+		GLenum status = s_poll_fence(slot.fence);
+		if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) return false;
+		glDeleteSync(slot.fence);
+		slot.fence = 0;
+		// This fence covers the slot's current-frame use. Waiting for the
+		// frame-end fence after it signals would deadlock same-frame reuse.
+		slot.in_flight_frame = 0;
+	}
+	if (slot.in_flight_frame == 0 || slot.in_flight_frame == g_ctx.frame_index) {
+		// Never used, or used THIS frame (no covering fence exists yet).
+		return slot.in_flight_frame == 0;
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (!g_ctx.frame_fences[i] || g_ctx.frame_fence_frames[i] < slot.in_flight_frame) continue;
+		if (!g_ctx.frame_fence_done[i]) {
+			GLenum status = s_poll_fence(g_ctx.frame_fences[i]);
+			if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) continue;
+			g_ctx.frame_fence_done[i] = true;
+		}
+		return true;
+	}
+	return false;
+}
+
+static inline CF_GL_Slot* s_acquire_slot(CF_GL_Ring* ring, uint32_t frame, int* out_index)
+{
+	int count = ring->count;
+	for (int tries = 0; tries < count; ++tries) {
+		int index = (ring->head + tries) % count;
+		CF_GL_Slot& slot = ring->slots[index];
+		if (s_slot_ready(slot)) {
+			ring->head = (index + 1) % count;
+			slot.last_use_frame = frame;
+			if (out_index) *out_index = index;
+			return &slot;
+		}
+	}
+	if (count < RING_BUFFER_CAPACITY) {
+		int index = count;
+		CF_GL_Slot& new_slot = ring->slots[index];
+		new_slot = CF_GL_Slot();
+		ring->count = count + 1;
+		ring->head = (index + 1) % ring->count;
+		new_slot.last_use_frame = frame;
+		if (out_index) *out_index = index;
+		return &new_slot;
+	}
+	return NULL;
+}
+
+static int s_fence_wait_count;
+
+int CF_CALL cf_gles_fence_wait_count()
+{
+	return s_fence_wait_count;
+}
+
+int CF_CALL cf_gles_texture_active_slot(CF_Texture texture)
+{
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)texture.id;
+	return t ? t->active_slot : -1;
+}
+
+// WebGL fences signal only once control returns to the browser, so waiting on one would
+// yield mid-frame and let the browser composite a half-drawn canvas.
+#ifdef CF_EMSCRIPTEN
+static const bool s_reuse_busy_slot = true;
+#else
+static bool s_reuse_busy_slot = false;
+#endif
+
+void CF_CALL cf_gles_reuse_busy_ring_slots(bool reuse)
+{
+#ifndef CF_EMSCRIPTEN
+	s_reuse_busy_slot = reuse;
+#else
+	CF_UNUSED(reuse);
+#endif
+}
+
+static inline CF_GL_Slot* s_force_slot(CF_GL_Ring* ring, uint32_t frame, int* out_index)
+{
+	if (!ring->count) return NULL;
+	int index = ring->head;
+	CF_GL_Slot& slot = ring->slots[index];
+	if (!s_slot_ready(slot)) {
+		if (s_reuse_busy_slot) {
+			// Ring uploads are glBufferSubData/glTexSubImage, which GL orders after the draws already issued.
+			if (slot.fence) {
+				glDeleteSync(slot.fence);
+				slot.fence = 0;
+			}
+			slot.in_flight_frame = 0;
+		} else {
+			++s_fence_wait_count;
+			// Block the CPU until the GPU is done with this slot.
+			// If you're seeing this on the hot-path of a profile or flame-graph it means you're GPU bound.
+			if (slot.in_flight_frame == g_ctx.frame_index && !slot.fence) {
+				// Reused within one frame: no covering frame fence exists yet, so raise one now.
+				slot.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+				glFlush();
+			}
+			if (slot.fence) {
+				glClientWaitSync(slot.fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
+				glDeleteSync(slot.fence);
+				slot.fence = 0;
+				slot.in_flight_frame = 0;
+			}
+			while (!s_slot_ready(slot)) cf_sleep(0);
+		}
+	}
+	slot.last_use_frame = frame;
+	ring->head = (index + 1) % ring->count;
+	if (out_index) *out_index = index;
+	return &slot;
+}
+
+static inline CF_GL_Slot* s_acquire_or_wait(CF_GL_Ring* ring, uint32_t frame, int* out_index)
+{
+	CF_GL_Slot* slot = s_acquire_slot(ring, frame, out_index);
+	if (slot) return slot;
+	return s_force_slot(ring, frame, out_index);
+}
+
+static inline void s_set_slot_fence(CF_GL_Slot& slot)
+{
+	slot.in_flight_frame = g_ctx.frame_index;
+}
+
+static inline CF_GL_RenderState s_default_state(CF_GL_Canvas* canvas)
+{
+	CF_GL_RenderState state = { };
+	state.viewport = { 0, 0, canvas->w, canvas->h };
+	state.scissor_enabled = false;
+	state.scissor = { 0, 0, canvas->w, canvas->h };
+	state.stencil_reference = 0;
+	state.blend_constants = { 0.0, 0.0, 0.0, 0.0 };
+	return state;
+}
+
+static inline bool s_canvas_has_depth(const CF_GL_Canvas* canvas)
+{
+	return canvas && canvas->has_depth;
+}
+
+static inline bool s_canvas_has_stencil(const CF_GL_Canvas* canvas)
+{
+	return canvas && canvas->has_stencil;
+}
+
+static inline void s_apply_state()
+{
+	CF_GL_RenderState* target = &g_ctx.target_state;
+	CF_GL_RenderState* current = &g_ctx.current_state;
+
+	if (target->viewport.x != current->viewport.x ||
+		target->viewport.y != current->viewport.y ||
+		target->viewport.w != current->viewport.w ||
+		target->viewport.h != current->viewport.h
+	) {
+		glViewport(target->viewport.x, target->viewport.y, target->viewport.w, target->viewport.h);
+	}
+
+	if (target->scissor_enabled != current->scissor_enabled) {
+		if (target->scissor_enabled) {
+			glEnable(GL_SCISSOR_TEST);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+	}
+
+	if (target->scissor_enabled &&
+	   (target->scissor.x != current->scissor.x ||
+		target->scissor.y != current->scissor.y ||
+		target->scissor.w != current->scissor.w ||
+		target->scissor.h != current->scissor.h)
+	) {
+		glScissor(target->scissor.x, target->scissor.y, target->scissor.w, target->scissor.h);
+	}
+	// GL keeps the last applied box while the test is off.
+	CF_GL_Rect scissor = target->scissor_enabled ? target->scissor : current->scissor;
+
+	if (target->stencil_reference != current->stencil_reference) {
+		GLenum front_compare = GL_ALWAYS;
+		GLenum back_compare = GL_ALWAYS;
+		GLuint mask = 0xFF;
+		if (g_ctx.material && g_ctx.material->state.stencil.enabled && s_canvas_has_stencil(g_ctx.canvas)) {
+			front_compare = s_wrap(g_ctx.material->state.stencil.front.compare);
+			back_compare = s_wrap(g_ctx.material->state.stencil.back.compare);
+			mask = g_ctx.material->state.stencil.read_mask;
+		}
+		glStencilFuncSeparate(GL_FRONT, front_compare, target->stencil_reference, mask);
+		glStencilFuncSeparate(GL_BACK, back_compare, target->stencil_reference, mask);
+	}
+
+	if (target->blend_constants.r != current->blend_constants.r ||
+	target->blend_constants.g != current->blend_constants.g ||
+	target->blend_constants.b != current->blend_constants.b ||
+		target->blend_constants.a != current->blend_constants.a
+	) {
+		glBlendColor(
+			target->blend_constants.r,
+			target->blend_constants.g,
+			target->blend_constants.b,
+			target->blend_constants.a
+		);
+	}
+
+	*current = *target;
+	current->scissor = scissor;
+	CF_POLL_OPENGL_ERROR();
+}
+
+static inline void s_bind_framebuffer(GLuint fbo)
+{
+	if (g_ctx.fbo != fbo) {
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		g_ctx.fbo = fbo;
+	}
+}
+
+static inline bool s_has_extension(const char* name)
+{
+	if (!name) return true;
+	GLint count = 0;
+	glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+	for (GLint i = 0; i < count; ++i) {
+		const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+		if (ext && CF_STRCMP(ext, name) == 0) return true;
+	}
+	return false;
+}
+
+static inline float s_anisotropy_limit()
+{
+	GLfloat v = 1.0f;
+	if (s_has_extension("GL_EXT_texture_filter_anisotropic")) {
+		glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &v);
+	}
+	return v;
+}
+
+// Clamps a requested ratio into [1, limit]. 1 disables anisotropic filtering.
+static inline float s_clamp_anisotropy(float requested)
+{
+	if (requested < 1.f) {
+		return 1.f;
+	} else if (requested > g_ctx.anisotropy_limit){
+		return g_ctx.anisotropy_limit;
+	} else {
+		return requested;
+	}
+}
+
+static inline CF_GL_PixelFormatInfo* s_find_pixel_format_info(CF_PixelFormat format)
+{
+	for (size_t i = 0; i < CF_ARRAY_SIZE(g_gl_pixel_formats); ++i) {
+		if (g_gl_pixel_formats[i].format == format) return &g_gl_pixel_formats[i];
+	}
+	return NULL;
+}
+
+static inline void s_load_format_caps()
+{
+	static bool s_caps_initialized = false;
+	if (s_caps_initialized) return;
+	s_caps_initialized = true;
+
+	for (size_t i = 0; i < CF_ARRAY_SIZE(g_gl_pixel_formats); ++i) {
+		CF_GL_PixelFormatInfo& info = g_gl_pixel_formats[i];
+		info.caps = 0;
+
+		if (info.internal_fmt == GL_NONE) continue;
+		if (!s_has_extension(info.required_extension)) continue;
+
+		// GL 3.3 core does not support querying these properties.
+		// Mark as unsupported by default.
+		// You can hardcode a conservative set of assumptions here if desired.
+
+		// Example conservative assumptions:
+		if (!info.is_integer) info.caps |= CF_GL_FMT_CAP_SAMPLE; // can sample
+		if (info.is_depth) info.caps |= CF_GL_FMT_CAP_SAMPLE;     // depth textures sample (shadow maps)
+		if (!info.is_integer) info.caps |= CF_GL_FMT_CAP_LINEAR; // linear filter on normalized formats
+		if (!info.is_depth) info.caps |= CF_GL_FMT_CAP_COLOR; // color attachment support on non-depth formats
+
+		if (info.has_alpha)   info.caps |= CF_GL_FMT_CAP_ALPHA;
+		if (info.is_depth)    info.caps |= CF_GL_FMT_CAP_DEPTH;
+		if (info.has_stencil) info.caps |= CF_GL_FMT_CAP_STENCIL;
+
+		// Dont set MSAA capability (GL_SAMPLES query not available in 3.3 core).
+		// If you want MSAA support, youll need to test by actually creating
+		// a multisampled renderbuffer and checking for errors.
+	}
+}
+
+static inline GLuint s_compile_shader(GLenum stage, const char* src, int src_len)
+{
+	GLuint s = glCreateShader(stage);
+	glShaderSource(s, 1, &src, &src_len);
+	glCompileShader(s);
+	GLint ok = GL_FALSE;
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[4096]; GLsizei len=0;
+		glGetShaderInfoLog(s, sizeof(log), &len, log);
+		fprintf(stderr, "GLSL compile error:\n%.*s\n", (int)len, log);
+	}
+	return s;
+}
+
+static inline GLuint s_make_program(CF_ShaderBytecode vs_bytecode, CF_ShaderBytecode fs_bytecode)
+{
+	GLuint vs = s_compile_shader(GL_VERTEX_SHADER,   vs_bytecode.glsl300_src, (int)vs_bytecode.glsl300_src_size);
+	GLuint fs = s_compile_shader(GL_FRAGMENT_SHADER, fs_bytecode.glsl300_src, (int)fs_bytecode.glsl300_src_size);
+
+	GLuint program = glCreateProgram();
+	glAttachShader(program, vs);
+	glAttachShader(program, fs);
+	glLinkProgram(program);
+
+	GLint ok = GL_FALSE;
+	glGetProgramiv(program, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char log[4096]; GLsizei len=0;
+		glGetProgramInfoLog(program, sizeof(log), &len, log);
+		fprintf(stderr, "GLSL link error:\n%.*s\n", (int)len, log);
+	}
+	glDetachShader(program, vs); glDetachShader(program, fs);
+	glDeleteShader(vs); glDeleteShader(fs);
+
+	return program;
+}
+
+// One bit per attrib location whose shader-side type is integer (ivec/uvec families). Those
+// locations must bind via glVertexAttribIPointer; see CF_GL_Shader::integer_attrib_mask.
+static uint64_t s_integer_attrib_mask(GLuint program)
+{
+	uint64_t mask = 0;
+	GLint count = 0;
+	glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &count);
+	for (GLint i = 0; i < count; ++i) {
+		char name[256];
+		GLsizei len = 0;
+		GLint size = 0;
+		GLenum type = GL_NONE;
+		glGetActiveAttrib(program, (GLuint)i, sizeof(name), &len, &size, &type, name);
+		bool integer = false;
+		switch (type) {
+		case GL_INT: case GL_INT_VEC2: case GL_INT_VEC3: case GL_INT_VEC4:
+		case GL_UNSIGNED_INT: case GL_UNSIGNED_INT_VEC2: case GL_UNSIGNED_INT_VEC3: case GL_UNSIGNED_INT_VEC4:
+			integer = true;
+			break;
+		default:
+			break;
+		}
+		if (!integer) continue;
+		GLint loc = glGetAttribLocation(program, name);
+		if (loc >= 0 && loc < 64) mask |= 1ULL << loc;
+	}
+	return mask;
+}
+
+CF_Result cf_gles_init(bool debug)
+{
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+
+	SDL_GL_SetAttribute(SDL_GL_RED_SIZE,     8);
+	SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE,   8);
+	SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE,    8);
+	SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE,   8);
+	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,   24);
+	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+
+	if (debug) {
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+	}
+	g_ctx.debug = debug;
+
+	return cf_result_success();
+}
+
+void cf_gles_destroy_shader_internal(CF_Shader sh);
+
+void cf_gles_cleanup()
+{
+	SDL_GL_DestroyContext(g_ctx.gl_ctx);
+}
+
+SDL_GLContext cf_gles_get_gl_context()
+{
+	return g_ctx.gl_ctx;
+}
+
+void cf_load_gles();
+static void s_reset_storage_bindings();
+static void s_apply_storage_textures();
+
+void cf_gles_attach(SDL_Window* window)
+{
+	g_ctx.gl_ctx = SDL_GL_CreateContext(window);
+	SDL_GL_MakeCurrent(window, g_ctx.gl_ctx);
+	cf_load_gles();
+	g_ctx.window = window;
+	// Query driver limits once
+	g_ctx.anisotropy_limit = s_anisotropy_limit();
+	// A fresh context recycles GL object ids, so cached bindings from a previous
+	// app/context lifetime would wrongly elide binds. Reset all cached GL state.
+	g_ctx.fbo = 0;
+	g_ctx.scratch_read_fbo = 0;
+	g_ctx.mesh = NULL;
+	g_ctx.material = NULL;
+	g_ctx.canvas = NULL;
+	g_ctx.enabled_vertex_attrib_mask = 0;
+	g_ctx.has_filter_override = false;
+	glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &g_ctx.max_combined_texture_units);
+	GLint max_draw_buffers = 4, max_color_attachments = 4; // GLES 3.0 guarantees four of each.
+	glGetIntegerv(GL_MAX_DRAW_BUFFERS, &max_draw_buffers);
+	glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &max_color_attachments);
+	g_ctx.max_canvas_targets = cf_min(cf_min((int)max_draw_buffers, (int)max_color_attachments), CF_MAX_CANVAS_TARGETS);
+	// The render-state diff cache must reset too, or state applied in a previous
+	// context elides the same state in this one (a stale viewport cache left every
+	// draw rasterizing into a 0x0 viewport -- the "Nth context renders nothing" bug).
+	g_ctx.current_state = { };
+	g_ctx.target_state = { };
+	// Pending emulated storage bindings point at buffers owned by the previous
+	// app lifetime; drop them rather than binding freed memory.
+	s_reset_storage_bindings();
+}
+
+bool cf_gles_supports_msaa(int sample_count)
+{
+	// GLES backend does not support MSAA.
+	CF_UNUSED(sample_count);
+	return false;
+}
+
+void cf_gles_flush()
+{
+	glFlush();
+}
+
+void cf_gles_gpu_sync()
+{
+	glFinish();
+}
+
+// Ring slots and frame fences don't care where GL's stream is cut, so a flush needs no bookkeeping.
+void cf_gles_gpu_submit()
+{
+	glFlush();
+}
+
+bool cf_gles_set_present_mode(CF_PresentMode mode)
+{
+	switch (mode) {
+	case CF_PRESENT_MODE_IMMEDIATE: return SDL_GL_SetSwapInterval(0);
+	case CF_PRESENT_MODE_VSYNC:     return SDL_GL_SetSwapInterval(1);
+	default:                        return false; // Mailbox isn't supported on the GLES3 backend.
+	}
+}
+
+void cf_gles_begin_frame()
+{
+	++g_ctx.frame_index;
+}
+
+void cf_gles_end_frame()
+{
+	int i = (int)(g_ctx.frame_index % 4);
+	if (g_ctx.frame_fences[i]) glDeleteSync(g_ctx.frame_fences[i]);
+	g_ctx.frame_fences[i] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	g_ctx.frame_fence_frames[i] = g_ctx.frame_index;
+	g_ctx.frame_fence_done[i] = false;
+	glFlush();
+#ifdef CF_EMSCRIPTEN
+	// WebGL presents once control returns to the browser, and SDL's swap does nothing on the web except yield
+	// for that.
+	if (!app->using_main_callbacks) SDL_GL_SwapWindow(g_ctx.window);
+#else
+	SDL_GL_SwapWindow(g_ctx.window);
+#endif
+}
+
+void cf_gles_blit_canvas(CF_Canvas canvas_handle)
+{
+	int window_width, window_height;
+	SDL_GetWindowSizeInPixels(g_ctx.window, &window_width, &window_height);
+	g_ctx.current_state.scissor_enabled = false;
+	CF_POLL_OPENGL_ERROR();
+	glDisable(GL_SCISSOR_TEST);
+	CF_POLL_OPENGL_ERROR();
+
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	CF_POLL_OPENGL_ERROR();
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, canvas->fbo);
+	CF_POLL_OPENGL_ERROR();
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	CF_POLL_OPENGL_ERROR();
+	glBlitFramebuffer(
+		0, canvas->h, canvas->w, 0,
+		0, 0, window_width, window_height,
+		GL_COLOR_BUFFER_BIT,
+		s_wrap(app->canvas_blit_filter)
+	);
+	CF_POLL_OPENGL_ERROR();
+	g_ctx.fbo = 0;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+bool cf_gles_texture_supports_format(CF_PixelFormat format, CF_TextureUsageBits usage)
+{
+	s_load_format_caps();
+	CF_GL_PixelFormatInfo* info = s_find_pixel_format_info(format);
+	if (!info || info->internal_fmt == GL_NONE) return false;
+		uint32_t caps = info->caps;
+		if (!caps) return false;
+		if (usage & CF_TEXTURE_USAGE_GRAPHICS_STORAGE_READ_BIT) return false;
+		// Emulated compute reads storage images with texelFetch and writes them as render targets.
+		if ((usage & (CF_TEXTURE_USAGE_SAMPLER_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_READ_BIT)) && !(caps & CF_GL_FMT_CAP_SAMPLE)) return false;
+		if ((usage & (CF_TEXTURE_USAGE_COLOR_TARGET_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_WRITE_BIT)) && !(caps & CF_GL_FMT_CAP_COLOR)) return false;
+		if (usage & CF_TEXTURE_USAGE_DEPTH_STENCIL_TARGET_BIT) {
+		if (!info->is_depth) return false;
+		if (!(caps & CF_GL_FMT_CAP_DEPTH)) return false;
+		if (info->has_stencil && !(caps & CF_GL_FMT_CAP_STENCIL)) return false;
+	}
+	return true;
+}
+
+bool cf_gles_query_pixel_format(CF_PixelFormat format, CF_PixelFormatOp op)
+{
+	s_load_format_caps();
+	CF_GL_PixelFormatInfo* info = s_find_pixel_format_info(format);
+	if (!info || info->internal_fmt == GL_NONE) return false;
+	uint32_t caps = info->caps;
+	if (!caps) return false;
+
+	switch (op) {
+	case CF_PIXELFORMAT_OP_NEAREST_FILTER:
+		return (caps & CF_GL_FMT_CAP_SAMPLE) != 0;
+
+	case CF_PIXELFORMAT_OP_BILINEAR_FILTER:
+		return (caps & CF_GL_FMT_CAP_SAMPLE) && (caps & CF_GL_FMT_CAP_LINEAR);
+
+	case CF_PIXELFORMAT_OP_RENDER_TARGET:
+		return (caps & CF_GL_FMT_CAP_COLOR) != 0;
+
+	case CF_PIXELFORMAT_OP_ALPHA_BLENDING:
+		if (!(caps & CF_GL_FMT_CAP_COLOR)) return false;
+		if (!(caps & CF_GL_FMT_CAP_ALPHA)) return false;
+		return !info->is_integer;
+
+	case CF_PIXELFORMAT_OP_MSAA:
+		if (info->is_depth) return (caps & CF_GL_FMT_CAP_MSAA) && (caps & CF_GL_FMT_CAP_DEPTH);
+		return (caps & CF_GL_FMT_CAP_MSAA) && (caps & CF_GL_FMT_CAP_COLOR);
+
+	case CF_PIXELFORMAT_OP_DEPTH:
+		return (caps & CF_GL_FMT_CAP_DEPTH) != 0;
+
+	default:
+		return false;
+	}
+}
+
+static inline void s_apply_sampler_state_to_handle(const CF_GL_Texture* t, GLuint handle)
+{
+	// Unit 0 explicitly: parameter application must not disturb whichever unit a
+	// previous draw or storage upload left active.
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(t->target, handle);
+	glTexParameteri(t->target, GL_TEXTURE_MIN_FILTER, t->min_filter);
+	glTexParameteri(t->target, GL_TEXTURE_MAG_FILTER, t->mag_filter);
+	// Without this, a standalone sampler using a mipmap min-filter would make
+	// a mipless texture incomplete (sampling black). Partial chains clamp for the same
+	// completeness reason, and so glGenerateMipmap stops at the last allocated level
+	// (it derives levels base+1 through q, where q honors GL_TEXTURE_MAX_LEVEL).
+	if (!t->has_mips) glTexParameteri(t->target, GL_TEXTURE_MAX_LEVEL, 0);
+	else if (t->mip_count > 0) glTexParameteri(t->target, GL_TEXTURE_MAX_LEVEL, t->mip_count - 1);
+	glTexParameteri(t->target, GL_TEXTURE_WRAP_S, t->wrap_u);
+	glTexParameteri(t->target, GL_TEXTURE_WRAP_T, t->wrap_v);
+	if (t->target == GL_TEXTURE_CUBE_MAP || t->target == GL_TEXTURE_3D) {
+		glTexParameteri(t->target, GL_TEXTURE_WRAP_R, t->wrap_u);
+	}
+	if (t->compare) {
+		glTexParameteri(t->target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+		glTexParameteri(t->target, GL_TEXTURE_COMPARE_FUNC, t->compare_func);
+	}
+	if (g_ctx.anisotropy_limit > 1.0f) {
+		glTexParameterf(t->target, GL_TEXTURE_MAX_ANISOTROPY_EXT, t->max_anisotropy);
+	}
+	glBindTexture(t->target, 0);
+}
+
+static inline void s_apply_sampler_params(CF_GL_Texture* t, const CF_TextureParams& p)
+{
+	s_load_format_caps();
+	CF_GL_PixelFormatInfo* info = s_find_pixel_format_info(p.pixel_format);
+	uint32_t caps = info ? info->caps : 0;
+	t->has_mips = p.allocate_mipmaps || p.mip_count > 1;
+	t->mip_count = t->has_mips ? p.mip_count : 0;
+	GLenum min_filter = s_wrap(p.mip_filter, t->has_mips);
+	GLenum mag_filter = s_wrap(p.filter);
+	if (!(caps & CF_GL_FMT_CAP_LINEAR)) {
+		min_filter = t->has_mips ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST;
+		mag_filter = GL_NEAREST;
+	}
+	t->min_filter = min_filter;
+	t->mag_filter = mag_filter;
+	t->wrap_u = s_wrap(p.wrap_u);
+	t->wrap_v = s_wrap(p.wrap_v);
+	t->max_anisotropy = s_clamp_anisotropy(p.max_anisotropy);
+
+	s_apply_sampler_state_to_handle(t, t->id);
+}
+
+static inline bool s_texture_allocate_storage(CF_GL_Texture* t, CF_GL_Slot* slot)
+{
+	if (!slot->handle) {
+		glGenTextures(1, &slot->handle);
+	}
+	if (!slot->handle) return false;
+	glBindTexture(t->target, slot->handle);
+	if (t->target == GL_TEXTURE_CUBE_MAP) {
+		for (int face = 0; face < 6; ++face) {
+			glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, t->internal_fmt, t->w, t->h, 0, t->upload_fmt, t->upload_type, NULL);
+		}
+	} else if (t->target == GL_TEXTURE_3D || t->target == GL_TEXTURE_2D_ARRAY) {
+		glTexImage3D(t->target, 0, t->internal_fmt, t->w, t->h, t->layers, 0, t->upload_fmt, t->upload_type, NULL);
+	} else {
+		glTexImage2D(GL_TEXTURE_2D, 0, t->internal_fmt, t->w, t->h, 0, t->upload_fmt, t->upload_type, NULL);
+	}
+	if (t->has_mips) {
+		// Allocate the chain up front: explicit-mip uploads (cf_texture_update_mip /
+		// _layer_mip) glTexSubImage into levels that must already have storage, and
+		// glGenerateMipmap isn't guaranteed to have run first. An explicit mip_count
+		// stops the chain early (GL_TEXTURE_MAX_LEVEL clamps sampling to match).
+		int lw = t->w, lh = t->h, ld = t->layers;
+		for (int level = 1; (lw > 1 || lh > 1) && !(t->mip_count > 0 && level >= t->mip_count); ++level) {
+			lw = cf_max(lw >> 1, 1);
+			lh = cf_max(lh >> 1, 1);
+			if (t->target == GL_TEXTURE_CUBE_MAP) {
+				for (int face = 0; face < 6; ++face) {
+					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, level, t->internal_fmt, lw, lh, 0, t->upload_fmt, t->upload_type, NULL);
+				}
+			} else if (t->target == GL_TEXTURE_3D || t->target == GL_TEXTURE_2D_ARRAY) {
+				if (t->target == GL_TEXTURE_3D) ld = cf_max(ld >> 1, 1);
+				glTexImage3D(t->target, level, t->internal_fmt, lw, lh, ld, 0, t->upload_fmt, t->upload_type, NULL);
+			} else {
+				glTexImage2D(GL_TEXTURE_2D, level, t->internal_fmt, lw, lh, 0, t->upload_fmt, t->upload_type, NULL);
+			}
+		}
+	}
+	glBindTexture(t->target, 0);
+	CF_POLL_OPENGL_ERROR();
+	return true;
+}
+
+static inline CF_GL_Slot* s_prepare_buffer_slot(CF_GL_Buffer* buffer, GLsizeiptr required_bytes, int* out_index)
+{
+	// Appending past every prior upload cannot overwrite a range a queued draw reads.
+	CF_GL_Ring& ring = buffer->ring;
+	CF_GL_Slot* slot = NULL;
+	int index = buffer->active_slot;
+	if (index >= 0 && index < ring.count) {
+		CF_GL_Slot& active = ring.slots[index];
+		if (required_bytes > 0 && required_bytes <= active.size - active.offset) slot = &active;
+	}
+	if (!slot) slot = s_acquire_slot(&ring, g_ctx.frame_index, &index);
+	// No idle slot: orphan one with glBufferData, GL keeps the old storage for queued draws.
+	bool orphan = slot == NULL;
+	if (orphan) {
+		index = ring.head;
+		slot = &ring.slots[index];
+		ring.head = (index + 1) % ring.count;
+	}
+	slot->last_use_frame = g_ctx.frame_index;
+	if (out_index) *out_index = index;
+	if (!slot->handle) {
+		glGenBuffers(1, &slot->handle);
+		slot->size = 0;
+		slot->offset = 0;
+	}
+	GLsizeiptr capacity = cf_max((int64_t)buffer->capacity, (int64_t)required_bytes);
+	if (buffer->target == GL_ARRAY_BUFFER) s_bind_array_buffer(slot->handle);
+	else if (buffer->target == GL_ELEMENT_ARRAY_BUFFER) s_bind_element_buffer(slot->handle);
+	else glBindBuffer(buffer->target, slot->handle);
+	if (orphan || slot->size < capacity || (required_bytes > 0 && required_bytes > slot->size - slot->offset)) {
+		glBufferData(buffer->target, capacity, NULL, GL_DYNAMIC_DRAW);
+		slot->size = capacity;
+		slot->offset = 0;
+		buffer->capacity = capacity;
+		if (slot->fence) {
+			glDeleteSync(slot->fence);
+			slot->fence = 0;
+		}
+		slot->in_flight_frame = 0;
+	}
+	return slot;
+}
+
+static inline void s_destroy_buffer(CF_GL_Buffer* buffer)
+{
+	for (int i = 0; i < buffer->ring.count; ++i) {
+		CF_GL_Slot& slot = buffer->ring.slots[i];
+		if (slot.fence) {
+			glDeleteSync(slot.fence);
+			slot.fence = 0;
+		}
+		if (slot.handle) {
+			s_forget_buffer(slot.handle);
+			glDeleteBuffers(1, &slot.handle);
+			slot.handle = 0;
+		}
+	}
+}
+
+static inline GLuint s_make_depth_renderbuffer(const CF_TextureParams& p)
+{
+	s_load_format_caps();
+	CF_GL_PixelFormatInfo* info = s_find_pixel_format_info(p.pixel_format);
+	if (!info || info->internal_fmt == GL_NONE || !info->is_depth) return 0;
+	if (!(info->caps & CF_GL_FMT_CAP_DEPTH)) return 0;
+	if (info->has_stencil && !(info->caps & CF_GL_FMT_CAP_STENCIL)) return 0;
+
+	GLuint rbo = 0;
+	glGenRenderbuffers(1, &rbo);
+	glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+	glRenderbufferStorage(GL_RENDERBUFFER, info->internal_fmt, p.width, p.height);
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	CF_POLL_OPENGL_ERROR();
+	return rbo;
+}
+
+CF_Texture cf_gles_make_texture(CF_TextureParams params)
+{
+	if (!cf_gles_texture_supports_format(params.pixel_format, (CF_TextureUsageBits)params.usage)) {
+		CF_ASSERT(!"Unsupported pixel format for GLES backend.");
+		return CF_Texture { 0ULL };
+	}
+
+	CF_GL_PixelFormatInfo* info = s_find_pixel_format_info(params.pixel_format);
+	if (!info || info->internal_fmt == GL_NONE) return CF_Texture{};
+
+	CF_GL_Texture* t = (CF_GL_Texture*)CF_CALLOC(sizeof(CF_GL_Texture));
+	t->w = params.width;
+	t->h = params.height;
+	switch (params.texture_type) {
+	case CF_TEXTURE_TYPE_CUBE:     t->target = GL_TEXTURE_CUBE_MAP; t->layers = 6; break;
+	case CF_TEXTURE_TYPE_3D:       t->target = GL_TEXTURE_3D;       t->layers = params.layer_count > 1 ? params.layer_count : 1; break;
+	case CF_TEXTURE_TYPE_2D_ARRAY: t->target = GL_TEXTURE_2D_ARRAY; t->layers = params.layer_count > 1 ? params.layer_count : 1; break;
+	default:                       t->target = GL_TEXTURE_2D;       t->layers = 1; break;
+	}
+	t->compare = params.compare_enable;
+	if (params.compare_enable) t->compare_func = s_wrap(params.compare_function);
+	t->internal_fmt = info->internal_fmt;
+	t->upload_fmt   = info->upload_fmt;
+	t->upload_type  = info->upload_type;
+	if (!info->is_depth && (t->upload_fmt == GL_NONE || t->upload_type == GL_NONE)) {
+		CF_FREE(t);
+		return CF_Texture { 0ULL };
+	}
+
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_acquire_or_wait(&t->ring, g_ctx.frame_index, &slot_index);
+	if (!slot) {
+		CF_FREE(t);
+		return CF_Texture { 0ULL };
+	}
+	if (!s_texture_allocate_storage(t, slot)) {
+		CF_FREE(t);
+		return CF_Texture { 0ULL };
+	}
+	t->id = slot->handle;
+	t->active_slot = slot_index;
+	s_apply_sampler_params(t, params);
+	if (params.allocate_mipmaps) {
+		glBindTexture(t->target, t->id);
+		glGenerateMipmap(t->target);
+		glBindTexture(t->target, 0);
+	}
+	CF_POLL_OPENGL_ERROR();
+
+	return CF_Texture{ (uint64_t)(uintptr_t)t };
+}
+
+void cf_gles_destroy_texture(CF_Texture tex)
+{
+	if (!tex.id) return;
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	glDeleteSamplers(2, t->draw_samplers);
+	for (int i = 0; i < t->ring.count; ++i) {
+		CF_GL_Slot& slot = t->ring.slots[i];
+		if (slot.fence) {
+			glDeleteSync(slot.fence);
+			slot.fence = 0;
+		}
+		if (slot.handle) {
+			glDeleteTextures(1, &slot.handle);
+			slot.handle = 0;
+		}
+	}
+	CF_POLL_OPENGL_ERROR();
+	CF_FREE(t);
+}
+
+void cf_gles_texture_update(CF_Texture tex, void* data, int /*size*/)
+{
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	CF_ASSERT(t->target == GL_TEXTURE_2D); // Non-2D textures upload per face/layer/slice.
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_acquire_or_wait(&t->ring, g_ctx.frame_index, &slot_index);
+	if (!slot) return;
+	if (!s_texture_allocate_storage(t, slot)) return;
+	t->id = slot->handle;
+	t->active_slot = slot_index;
+	s_apply_sampler_state_to_handle(t, t->id);
+	glBindTexture(GL_TEXTURE_2D, t->id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t->w, t->h, t->upload_fmt, t->upload_type, data);
+	if (t->has_mips) glGenerateMipmap(GL_TEXTURE_2D);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_texture_update_layer_mip(CF_Texture tex, void* data, int /*size*/, int layer, int mip)
+{
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	if (!t || layer < 0 || layer >= t->layers) return;
+	// Per-layer uploads update in place (no ring rotation): faces of one cube must all
+	// land in the same storage, and non-2D textures aren't the streaming case anyway.
+	int w = cf_max(t->w >> mip, 1);
+	int h = cf_max(t->h >> mip, 1);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(t->target, t->id);
+	if (t->target == GL_TEXTURE_CUBE_MAP) {
+		glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, mip, 0, 0, w, h, t->upload_fmt, t->upload_type, data);
+	} else if (t->target == GL_TEXTURE_2D) {
+		// Plain 2D: layer 0 is the texture itself; explicit-mip uploads land in place
+		// (glTexSubImage3D would be an INVALID_ENUM on this target).
+		glTexSubImage2D(GL_TEXTURE_2D, mip, 0, 0, w, h, t->upload_fmt, t->upload_type, data);
+	} else {
+		glTexSubImage3D(t->target, mip, 0, 0, layer, w, h, 1, t->upload_fmt, t->upload_type, data);
+	}
+	// Auto-regen only for plain 2D mip-0 refreshes: on cube/array targets glGenerateMipmap
+	// rebuilds EVERY face/layer, which would clobber explicit mips already uploaded to the
+	// other faces (the DDS loader walks face-major). Per-layer users who want an auto chain
+	// call cf_generate_mipmaps once, after all faces are in.
+	if (t->has_mips && mip == 0 && t->target == GL_TEXTURE_2D) glGenerateMipmap(t->target);
+	glBindTexture(t->target, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_texture_update_layer(CF_Texture tex, void* data, int size, int layer)
+{
+	cf_gles_texture_update_layer_mip(tex, data, size, layer, 0);
+}
+
+void cf_gles_texture_update_mip(CF_Texture tex, void* data, int /*size*/, int mip)
+{
+	// In place, no ring rotation: an explicit-mip upload is one level of a texture whose
+	// other levels must survive (rotating to a fresh slot would leave every other level
+	// unallocated garbage and discard the base image).
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	int w = cf_max(t->w >> mip, 1);
+	int h = cf_max(t->h >> mip, 1);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, t->id);
+	glTexSubImage2D(GL_TEXTURE_2D, mip, 0, 0, w, h, t->upload_fmt, t->upload_type, data);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_texture_update_region(CF_Texture tex, int x, int y, int w, int h, void* pixels)
+{
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	CF_ASSERT(t->target == GL_TEXTURE_2D);
+	// Region updates write in place (no ring rotation): several region uploads/copies
+	// compose one texture, so rotating to a fresh slot would discard prior regions.
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, t->id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, t->upload_fmt, t->upload_type, pixels);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_texture_copy_region(CF_Texture dst, int dst_x, int dst_y, CF_Texture src, int src_x, int src_y, int w, int h)
+{
+	CF_GL_Texture* s = (CF_GL_Texture*)(uintptr_t)src.id;
+	CF_GL_Texture* d = (CF_GL_Texture*)(uintptr_t)dst.id;
+	CF_ASSERT(s->target == GL_TEXTURE_2D && d->target == GL_TEXTURE_2D);
+	// Attach the source to a scratch read framebuffer and copy the region into the
+	// destination texture. Written in place (no ring rotation), see update_region.
+	if (!g_ctx.scratch_read_fbo) glGenFramebuffers(1, &g_ctx.scratch_read_fbo);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, g_ctx.scratch_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->id, 0);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, d->id);
+	glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dst_x, dst_y, src_x, src_y, w, h);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	// Restore the read binding to the cached framebuffer -- s_bind_framebuffer binds
+	// GL_FRAMEBUFFER (read+draw) and elides rebinds of the same id, so leaving the read
+	// side pointing at the scratch fbo would go unnoticed.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, g_ctx.fbo);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_generate_mipmaps(CF_Texture tex)
+{
+	CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)tex.id;
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(t->target, t->id);
+	glGenerateMipmap(t->target);
+	glBindTexture(t->target, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+uint64_t cf_gles_texture_handle(CF_Texture t)
+{
+	return ((CF_GL_Texture*)t.id)->id;
+}
+
+uint64_t cf_gles_texture_binding_handle(CF_Texture t)
+{
+	return ((CF_GL_Texture*)t.id)->id;
+}
+
+int cf_gles_query_max_canvas_targets()
+{
+	return g_ctx.max_canvas_targets;
+}
+
+CF_Canvas cf_gles_make_canvas(CF_CanvasParams params)
+{
+	int target_count = params.target_count > 1 ? params.target_count : 1;
+	if (!cf_canvas_target_count_supported(target_count)) return CF_Canvas{};
+	CF_ASSERT(target_count == 1 || params.sample_count == CF_SAMPLE_COUNT_1);
+	for (int i = 0; i < target_count; ++i) {
+		if (!cf_gles_texture_supports_format(params.targets[i].pixel_format, (CF_TextureUsageBits)params.targets[i].usage)) {
+			CF_ASSERT(!"Unsupported color target format for GLES backend.");
+			return CF_Canvas{};
+		}
+	}
+	if (params.depth_stencil_enable) {
+		if (!cf_gles_texture_supports_format(params.depth_stencil_target.pixel_format, (CF_TextureUsageBits)params.depth_stencil_target.usage)) {
+			CF_ASSERT(!"Unsupported depth/stencil format for GLES backend.");
+			return CF_Canvas{};
+		}
+	}
+
+	CF_GL_Canvas* c = (CF_GL_Canvas*)CF_CALLOC(sizeof(CF_GL_Canvas));
+	c->has_depth = false;
+	c->has_stencil = false;
+
+	// Color: an owned 2D texture, or an attached face/layer of a user texture. A DEPTH-format
+	// attach becomes the depth attachment instead, with no color side at all.
+	if (params.attach_target.id) {
+		CF_GL_Texture* attach = (CF_GL_Texture*)(uintptr_t)params.attach_target.id;
+		c->attached = true;
+		c->w = attach->w >> params.attach_mip; if (c->w < 1) c->w = 1;
+		c->h = attach->h >> params.attach_mip; if (c->h < 1) c->h = 1;
+		c->depth_internal_fmt = attach->internal_fmt;
+		switch (attach->internal_fmt) {
+		case GL_DEPTH_COMPONENT16:
+		case GL_DEPTH_COMPONENT24:
+		case GL_DEPTH_COMPONENT32F:
+			c->attached_depth = true;
+			c->has_depth = true;
+			break;
+		case GL_DEPTH24_STENCIL8:
+		case GL_DEPTH32F_STENCIL8:
+			c->attached_depth = true;
+			c->has_depth = true;
+			c->has_stencil = true;
+			break;
+		default:
+			break;
+		}
+		if (c->attached_depth) {
+			c->cf_depth = params.attach_target;
+		} else {
+			c->cf_color = params.attach_target;
+			c->color = attach->id;
+		}
+	} else {
+	c->w = params.target.width;
+	c->h = params.target.height;
+	CF_Texture color = cf_gles_make_texture(params.target);
+	c->cf_color = color;
+	if (!color.id) {
+	CF_FREE(c);
+	return CF_Canvas{};
+	}
+	c->color = ((CF_GL_Texture*)(uintptr_t)color.id)->id;
+	}
+	c->target_count = target_count;
+	for (int i = 1; i < target_count; ++i) {
+		CF_Texture t = cf_gles_make_texture(params.targets[i]);
+		if (!t.id) {
+			for (int j = 1; j < i; ++j) cf_gles_destroy_texture(c->cf_colors_mrt[j]);
+			if (!c->attached) cf_gles_destroy_texture(c->cf_color);
+			CF_FREE(c);
+			return CF_Canvas{};
+		}
+		c->cf_colors_mrt[i] = t;
+		c->colors_mrt[i] = ((CF_GL_Texture*)(uintptr_t)t.id)->id;
+	}
+
+	// Depth/stencil: a renderbuffer normally, or a sampleable depth texture when the
+	// depth target requests SAMPLER usage (the shadow-map case). Depth-attached canvases
+	// already have their depth: the attach target itself.
+	if (params.depth_stencil_enable && !c->attached_depth) {
+	// Attach-mode canvases size their depth to the attached face/mip, not to whatever the
+	// caller's params happen to hold (cf_canvas_defaults(0, 0) holds zero).
+	if (c->attached) {
+		params.depth_stencil_target.width = c->w;
+		params.depth_stencil_target.height = c->h;
+	}
+	CF_GL_PixelFormatInfo* depth_info = s_find_pixel_format_info(params.depth_stencil_target.pixel_format);
+	c->has_depth = depth_info && (depth_info->caps & CF_GL_FMT_CAP_DEPTH);
+	c->has_stencil = depth_info && depth_info->has_stencil && (depth_info->caps & CF_GL_FMT_CAP_STENCIL);
+	c->depth_internal_fmt = depth_info ? depth_info->internal_fmt : GL_NONE;
+	if (params.depth_stencil_target.usage & CF_TEXTURE_USAGE_SAMPLER_BIT) {
+	c->cf_depth = cf_gles_make_texture(params.depth_stencil_target);
+	if (!c->cf_depth.id) {
+	if (!c->attached) cf_gles_destroy_texture(c->cf_color);
+	CF_FREE(c);
+	return CF_Canvas{};
+	}
+	} else {
+	c->depth = s_make_depth_renderbuffer(params.depth_stencil_target);
+	if (!c->depth) {
+	if (!c->attached) cf_gles_destroy_texture(c->cf_color);
+	CF_FREE(c);
+	return CF_Canvas{};
+	}
+	}
+	}
+
+	glGenFramebuffers(1, &c->fbo);
+	s_bind_framebuffer(c->fbo);
+	if (c->attached_depth) {
+		CF_GL_Texture* attach = (CF_GL_Texture*)(uintptr_t)params.attach_target.id;
+		GLenum attachment = c->has_stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+		if (attach->target == GL_TEXTURE_CUBE_MAP) {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, attachment,
+				GL_TEXTURE_CUBE_MAP_POSITIVE_X + params.attach_layer, attach->id, params.attach_mip);
+		} else if (attach->target == GL_TEXTURE_2D) {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, attach->id, params.attach_mip);
+		} else {
+			glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, attach->id, params.attach_mip, params.attach_layer);
+		}
+		// Depth-only: no color buffer to draw into or read from.
+		GLenum none = GL_NONE;
+		glDrawBuffers(1, &none);
+		glReadBuffer(GL_NONE);
+	} else if (c->attached) {
+		CF_GL_Texture* attach = (CF_GL_Texture*)(uintptr_t)params.attach_target.id;
+		if (attach->target == GL_TEXTURE_CUBE_MAP) {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				GL_TEXTURE_CUBE_MAP_POSITIVE_X + params.attach_layer, c->color, params.attach_mip);
+		} else if (attach->target == GL_TEXTURE_2D) {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->color, params.attach_mip);
+		} else {
+			// 2D arrays and 3D textures attach by layer/slice.
+			glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, c->color, params.attach_mip, params.attach_layer);
+		}
+	} else {
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->color, 0);
+	}
+	for (int i = 1; i < target_count; ++i) {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, c->colors_mrt[i], 0);
+	}
+	if (target_count > 1) {
+		// Draw-buffer bindings are framebuffer state, so setting them once here covers
+		// every subsequent bind of this FBO.
+		GLenum bufs[CF_MAX_CANVAS_TARGETS];
+		for (int i = 0; i < target_count; ++i) bufs[i] = GL_COLOR_ATTACHMENT0 + (GLenum)i;
+		glDrawBuffers(target_count, bufs);
+	}
+	if (c->depth) {
+		GLenum attachment = c->has_stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, c->depth);
+	} else if (c->cf_depth.id && !c->attached_depth) {
+		GLenum attachment = c->has_stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+		glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, ((CF_GL_Texture*)(uintptr_t)c->cf_depth.id)->id, 0);
+	}
+	CF_ASSERT(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+	CF_POLL_OPENGL_ERROR();
+
+	return CF_Canvas{ (uint64_t)(uintptr_t)c };
+}
+
+void cf_gles_destroy_canvas(CF_Canvas ch)
+{
+	if (!ch.id) return;
+	CF_GL_Canvas* c = (CF_GL_Canvas*)(uintptr_t)ch.id;
+	if (c->depth) glDeleteRenderbuffers(1, &c->depth);
+	if (c->cf_depth.id && !c->attached_depth) cf_gles_destroy_texture(c->cf_depth);
+	if (c->fbo) {
+		// Deleting the currently bound framebuffer reverts GL's binding to zero; the
+		// bind cache must follow, or a new FBO that reuses this id is never truly
+		// bound and its attachments land on the default framebuffer.
+		if (g_ctx.fbo == c->fbo) g_ctx.fbo = 0;
+		glDeleteFramebuffers(1, &c->fbo);
+	}
+	if (!c->attached) cf_gles_destroy_texture(c->cf_color);
+	for (int i = 1; i < c->target_count; ++i) {
+		if (c->cf_colors_mrt[i].id) cf_gles_destroy_texture(c->cf_colors_mrt[i]);
+	}
+	CF_POLL_OPENGL_ERROR();
+	CF_FREE(c);
+}
+
+void cf_gles_canvas_get_size(CF_Canvas canvas_handle, int* w, int* h)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	if (canvas) {
+		if (w) { *w = canvas->w; }
+		if (h) { *h = canvas->h; }
+	}
+}
+
+CF_Texture cf_gles_canvas_get_target(CF_Canvas ch)
+{
+	CF_GL_Canvas* c = (CF_GL_Canvas*)(uintptr_t)ch.id;
+	return c->cf_color;
+}
+
+CF_Texture cf_gles_canvas_get_target2(CF_Canvas ch, int index)
+{
+	CF_GL_Canvas* c = (CF_GL_Canvas*)(uintptr_t)ch.id;
+	if (!c || index < 0 || index >= (c->target_count > 1 ? c->target_count : 1)) return { 0 };
+	return index == 0 ? c->cf_color : c->cf_colors_mrt[index];
+}
+
+CF_Texture cf_gles_canvas_get_depth_stencil_target(CF_Canvas ch)
+{
+	// Sampleable only when the canvas asked for it: give the depth target SAMPLER usage
+	// and it is backed by a depth texture rather than a renderbuffer.
+	CF_GL_Canvas* c = (CF_GL_Canvas*)(uintptr_t)ch.id;
+	return c ? c->cf_depth : CF_Texture{};
+}
+
+static CF_CanvasDepthDesc s_canvas_depth_desc(const CF_GL_Canvas* c)
+{
+	CF_CanvasDepthDesc desc = { };
+	if (!c) return desc;
+	desc.valid = true;
+	desc.has_depth = c->has_depth;
+	desc.w = c->w;
+	desc.h = c->h;
+	desc.format = (uint32_t)c->depth_internal_fmt;
+	desc.sample_count = 1;
+	return desc;
+}
+
+void cf_gles_canvas_copy_depth(CF_Canvas dst_handle, CF_Canvas src_handle)
+{
+	CF_GL_Canvas* dst = (CF_GL_Canvas*)(uintptr_t)dst_handle.id;
+	CF_GL_Canvas* src = (CF_GL_Canvas*)(uintptr_t)src_handle.id;
+	if (!cf_canvas_copy_depth_check(s_canvas_depth_desc(dst), s_canvas_depth_desc(src), dst && dst == src)) return;
+
+	// Blits obey the scissor test and write masks like draws do. Same reset as s_clear_canvas;
+	// per-draw state application rebuilds all of it.
+	g_ctx.current_state.scissor_enabled = false;
+	glDisable(GL_SCISSOR_TEST);
+	glDepthMask(GL_TRUE);
+	glStencilMask(0xFF);
+	GLbitfield bits = GL_DEPTH_BUFFER_BIT;
+	if (src->has_stencil) bits |= GL_STENCIL_BUFFER_BIT;
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, src->fbo);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->fbo);
+	// Depth/stencil blits require GL_NEAREST and identical formats (checked above).
+	glBlitFramebuffer(0, 0, src->w, src->h, 0, 0, dst->w, dst->h, bits, GL_NEAREST);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_ctx.fbo);
+	CF_POLL_OPENGL_ERROR();
+}
+
+static inline void s_clear_canvas(const CF_GL_Canvas* canvas)
+{
+	GLbitfield bits = 0;
+	int clear_target_count = canvas->attached_depth ? 0 : (canvas->target_count > 1 ? canvas->target_count : 1);
+	if (s_canvas_has_depth(canvas)) {
+		glClearDepthf(canvas->has_clear_depth_stencil ? canvas->clear_depth : app->clear_depth);
+		bits |= GL_DEPTH_BUFFER_BIT;
+	}
+	if (s_canvas_has_stencil(canvas)) {
+		glClearStencil((GLint)(canvas->has_clear_depth_stencil ? canvas->clear_stencil : app->clear_stencil));
+		bits |= GL_STENCIL_BUFFER_BIT;
+	}
+	g_ctx.current_state.scissor_enabled = false;
+	glDisable(GL_SCISSOR_TEST);
+	// Clears are gated by the write masks exactly like draws, so force everything
+	// writable -- a 2d pass ending with depth writes off would otherwise silently turn
+	// the next frame's depth clear into a no-op (the scissor line above is the same
+	// lesson for the scissor box). Per-draw state application rebuilds these anyway.
+	glDepthMask(GL_TRUE);
+	glStencilMask(0xFF);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	// Color clears go through glClearBufferfv so each target can have its own clear color;
+	// depth/stencil still clear through glClear.
+	for (int i = 0; i < clear_target_count; ++i) {
+		CF_Color cc = canvas->has_clear_color[i] ? canvas->clear_color[i] : app->clear_color;
+		float rgba[4] = { cc.r, cc.g, cc.b, cc.a };
+		glClearBufferfv(GL_COLOR, i, rgba);
+	}
+	if (bits) glClear(bits);
+}
+
+void cf_gles_clear_canvas(CF_Canvas canvas_handle)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+
+	GLuint fbo = g_ctx.fbo;
+	s_bind_framebuffer(canvas->fbo);
+	s_clear_canvas(canvas);
+	s_bind_framebuffer(fbo);
+
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_apply_canvas(CF_Canvas canvas_handle, bool clear)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	s_bind_framebuffer(canvas->fbo);
+	g_ctx.canvas = canvas;
+	if (clear) { s_clear_canvas(canvas); }
+
+	// Pass boundary: pending emulated storage bindings don't outlive it, mirroring
+	// SDL_GPU where storage binds are scoped to the render pass they were applied in.
+	s_reset_storage_bindings();
+	g_ctx.target_state = s_default_state(canvas);
+}
+
+CF_Mesh cf_gles_make_mesh(int vertex_buffer_size, const CF_VertexAttribute* attributes, int attribute_count, int vertex_stride)
+{
+	auto* m = (CF_GL_Mesh*)CF_CALLOC(sizeof(CF_GL_Mesh));
+	m->vbo.target = GL_ARRAY_BUFFER;
+	m->vbo.capacity = vertex_buffer_size;
+	m->vbo.stride = vertex_stride;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->vbo, vertex_buffer_size, &slot_index);
+	if (slot) {
+		m->vbo.id = slot->handle;
+		m->vbo.active_slot = slot_index;
+		s_bind_array_buffer(0);
+	}
+	m->attribute_count = cf_min(attribute_count, CF_MESH_MAX_VERTEX_ATTRIBUTES);
+	for (int i = 0; i < m->attribute_count; ++i) {
+		m->attributes[i] = attributes[i];
+		m->attributes[i].name = sintern(attributes[i].name);
+	}
+	CF_POLL_OPENGL_ERROR();
+	return CF_Mesh{ (uint64_t)(uintptr_t)m };
+}
+
+void cf_gles_mesh_set_index_buffer(CF_Mesh mh, int index_buffer_size_in_bytes, int index_bit_count)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	CF_ASSERT(index_bit_count == 16 || index_bit_count == 32);
+	m->ibo.target = GL_ELEMENT_ARRAY_BUFFER;
+	m->ibo.capacity = index_buffer_size_in_bytes;
+	m->ibo.stride = index_bit_count / 8;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->ibo, index_buffer_size_in_bytes, &slot_index);
+	if (slot) {
+		m->ibo.id = slot->handle;
+		m->ibo.active_slot = slot_index;
+		s_bind_element_buffer(0);
+	}
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_mesh_append_attributes(CF_Mesh mesh_handle, const CF_VertexAttribute* attributes, int attribute_count)
+{
+	CF_GL_Mesh* mesh = (CF_GL_Mesh*)(uintptr_t)mesh_handle.id;
+	for (int i = 0; i < attribute_count && mesh->attribute_count < CF_MESH_MAX_VERTEX_ATTRIBUTES; ++i) {
+		CF_VertexAttribute attr = attributes[i];
+		attr.name = cf_sintern(attr.name);
+		mesh->attributes[mesh->attribute_count++] = attr;
+	}
+	mesh->attrib_cache_generation = 0; // New attributes: stale location cache.
+}
+
+// Standalone instance buffers (draw3d baked lists): a plain GL buffer, no streaming ring --
+// contents upload at bake and change rarely, and glBufferData re-specifies on update.
+struct CF_GL_InstanceBuffer
+{
+	GLuint id;
+	int size;
+	int stride;
+};
+
+static GLuint s_gl_instance_override = 0;
+static int s_gl_instance_override_count = 0;
+static int s_gl_instance_override_stride = 0;
+static int s_gl_instance_override_offset = 0; // Byte offset: the bound slice of a shared buffer.
+
+uint64_t cf_gles_make_instance_buffer(int size_in_bytes, int stride)
+{
+	CF_GL_InstanceBuffer* b = (CF_GL_InstanceBuffer*)CF_CALLOC(sizeof(CF_GL_InstanceBuffer));
+	b->size = size_in_bytes;
+	b->stride = stride;
+	glGenBuffers(1, &b->id);
+	s_bind_array_buffer(b->id);
+	glBufferData(GL_ARRAY_BUFFER, size_in_bytes, NULL, GL_STATIC_DRAW);
+	s_bind_array_buffer(0);
+	CF_POLL_OPENGL_ERROR();
+	return (uint64_t)(uintptr_t)b;
+}
+
+void cf_gles_update_instance_buffer(uint64_t handle, void* data, int count)
+{
+	CF_GL_InstanceBuffer* b = (CF_GL_InstanceBuffer*)(uintptr_t)handle;
+	int bytes = count * b->stride;
+	s_bind_array_buffer(b->id);
+	if (bytes > b->size) b->size = bytes;
+	glBufferData(GL_ARRAY_BUFFER, b->size, NULL, GL_STATIC_DRAW); // Orphan: updates are rare.
+	glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, data);
+	s_bind_array_buffer(0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_destroy_instance_buffer(uint64_t handle)
+{
+	CF_GL_InstanceBuffer* b = (CF_GL_InstanceBuffer*)(uintptr_t)handle;
+	if (!b) return;
+	if (b->id) {
+		s_forget_buffer(b->id);
+		glDeleteBuffers(1, &b->id);
+	}
+	CF_FREE(b);
+}
+
+void cf_gles_apply_instance_buffer_override(uint64_t handle, int count, int offset_bytes)
+{
+	CF_GL_InstanceBuffer* b = (CF_GL_InstanceBuffer*)(uintptr_t)handle;
+	s_gl_instance_override = b ? b->id : 0;
+	s_gl_instance_override_count = b ? count : 0;
+	s_gl_instance_override_stride = b ? b->stride : 0;
+	s_gl_instance_override_offset = b ? offset_bytes : 0;
+}
+
+CF_Sampler cf_gles_make_sampler(CF_SamplerParams params)
+{
+	GLuint id = 0;
+	glGenSamplers(1, &id);
+	GLenum min_filter;
+	if (params.filter == CF_FILTER_NEAREST) {
+		min_filter = params.mip_filter == CF_MIP_FILTER_LINEAR ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST;
+	} else {
+		min_filter = params.mip_filter == CF_MIP_FILTER_LINEAR ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST;
+	}
+	glSamplerParameteri(id, GL_TEXTURE_MIN_FILTER, min_filter);
+	glSamplerParameteri(id, GL_TEXTURE_MAG_FILTER, s_wrap(params.filter));
+	glSamplerParameteri(id, GL_TEXTURE_WRAP_S, s_wrap(params.wrap_u));
+	glSamplerParameteri(id, GL_TEXTURE_WRAP_T, s_wrap(params.wrap_v));
+	glSamplerParameteri(id, GL_TEXTURE_WRAP_R, s_wrap(params.wrap_w));
+	glSamplerParameterf(id, GL_TEXTURE_MIN_LOD, params.min_lod);
+	glSamplerParameterf(id, GL_TEXTURE_MAX_LOD, params.max_lod);
+	if (g_ctx.anisotropy_limit > 1.0f) {
+		glSamplerParameterf(id, GL_TEXTURE_MAX_ANISOTROPY_EXT, s_clamp_anisotropy((float)params.max_anisotropy));
+	}
+	if (params.compare_enable) {
+		glSamplerParameteri(id, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+		glSamplerParameteri(id, GL_TEXTURE_COMPARE_FUNC, s_wrap(params.compare_function));
+	}
+	CF_POLL_OPENGL_ERROR();
+	CF_Sampler result;
+	result.id = (uint64_t)id;
+	return result;
+}
+
+void cf_gles_destroy_sampler(CF_Sampler sampler)
+{
+	GLuint id = (GLuint)sampler.id;
+	if (id) glDeleteSamplers(1, &id);
+}
+
+bool cf_gles_mesh_has_vertex_attribute(CF_Mesh mh, const char* name)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	for (int i = 0; i < m->attribute_count; ++i) {
+		if (!CF_STRCMP(m->attributes[i].name, name)) return true;
+	}
+	return false;
+}
+
+int cf_gles_mesh_instance_stride(CF_Mesh mh)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	return m->instance.stride;
+}
+
+bool cf_gles_mesh_draw3d_augmented(CF_Mesh mh)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	return m->draw3d_augmented;
+}
+
+void cf_gles_mesh_set_draw3d_augmented(CF_Mesh mh)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	m->draw3d_augmented = true;
+}
+
+void cf_gles_mesh_set_instance_buffer(CF_Mesh mh, int instance_buffer_size_in_bytes, int instance_stride)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	m->instance.target = GL_ARRAY_BUFFER;
+	m->instance.capacity = instance_buffer_size_in_bytes;
+	m->instance.stride = instance_stride;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->instance, instance_buffer_size_in_bytes, &slot_index);
+	if (slot) {
+		m->instance.id = slot->handle;
+		m->instance.active_slot = slot_index;
+		s_bind_array_buffer(0);
+	}
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_mesh_update_vertex_data(CF_Mesh mh, void* verts, int vertex_count)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	if (!m->vbo.stride) return;
+	GLsizeiptr bytes = (GLsizeiptr)vertex_count * m->vbo.stride;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->vbo, bytes, &slot_index);
+	if (!slot) return;
+	GLintptr upload_offset = slot->offset;
+	if (bytes > 0) {
+		glBufferSubData(GL_ARRAY_BUFFER, upload_offset, bytes, verts);
+		slot->offset = s_align_up(upload_offset + bytes, 256);
+	} else {
+		slot->offset = 0;
+	}
+	s_bind_array_buffer(0);
+	m->vbo.id = slot->handle;
+	m->vbo.active_slot = slot_index;
+	m->vbo.active_offset = upload_offset;
+	m->vbo.count = vertex_count;
+	m->vbo.version++;
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_mesh_update_index_data(CF_Mesh mh, void* indices, int index_count)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	int stride = m->ibo.stride ? m->ibo.stride : (int)sizeof(uint16_t);
+	GLsizeiptr bytes = (GLsizeiptr)index_count * stride;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->ibo, bytes, &slot_index);
+	if (!slot) return;
+	GLintptr upload_offset = slot->offset;
+	if (bytes > 0) {
+		glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, upload_offset, bytes, indices);
+		slot->offset = s_align_up(upload_offset + bytes, 256);
+	} else {
+		slot->offset = 0;
+	}
+	s_bind_element_buffer(0);
+	m->ibo.id = slot->handle;
+	m->ibo.active_slot = slot_index;
+	m->ibo.active_offset = upload_offset;
+	m->ibo.count = index_count;
+	m->ibo.version++;
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_mesh_update_instance_data(CF_Mesh mh, void* instances, int instance_count)
+{
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	if (!m->instance.stride) return;
+	GLsizeiptr bytes = (GLsizeiptr)instance_count * m->instance.stride;
+	int slot_index = -1;
+	CF_GL_Slot* slot = s_prepare_buffer_slot(&m->instance, bytes, &slot_index);
+	if (!slot) return;
+	GLintptr upload_offset = slot->offset;
+	if (bytes > 0) {
+		glBufferSubData(GL_ARRAY_BUFFER, upload_offset, bytes, instances);
+		slot->offset = s_align_up(upload_offset + bytes, 256);
+	} else {
+		slot->offset = 0;
+	}
+	s_bind_array_buffer(0);
+	m->instance.id = slot->handle;
+	m->instance.active_slot = slot_index;
+	m->instance.active_offset = upload_offset;
+	m->instance.count = instance_count;
+	m->instance.version++;
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_destroy_mesh(CF_Mesh mh)
+{
+	if (!mh.id) return;
+	auto* m = (CF_GL_Mesh*)(uintptr_t)mh.id;
+	s_destroy_buffer(&m->vbo);
+	s_destroy_buffer(&m->ibo);
+	s_destroy_buffer(&m->instance);
+	CF_POLL_OPENGL_ERROR();
+	CF_FREE(m);
+}
+
+void cf_gles_apply_mesh(CF_Mesh mesh_handle)
+{
+	CF_GL_Mesh* mesh = (CF_GL_Mesh*)(uintptr_t)mesh_handle.id;
+	g_ctx.mesh = mesh;
+}
+
+static void s_build_uniforms(GLuint program, CF_GL_ShaderInfo* shader_info, const CF_ShaderInfo* uniform_info, GLuint* binding_point, bool is_vs)
+{
+	shader_info->uniform_members = (CF_ShaderUniformMemberInfo*)CF_ALLOC(sizeof(CF_ShaderUniformMemberInfo) * uniform_info->num_uniform_members);
+	for (int member_index = 0; member_index < uniform_info->num_uniform_members; ++member_index) {
+		shader_info->uniform_members[member_index] = uniform_info->uniform_members[member_index];
+		shader_info->uniform_members[member_index].name = cf_sintern(shader_info->uniform_members[member_index].name);
+	}
+
+	CF_ShaderUniformMemberInfo* members = shader_info->uniform_members;
+	shader_info->num_uniform_blocks = uniform_info->num_uniforms;
+	for (int block_index = 0; block_index < uniform_info->num_uniforms; ++block_index) {
+		CF_GL_ShaderUniformBlock* block = &shader_info->uniform_blocks[block_index];
+		block->info = uniform_info->uniforms[block_index];
+		block->info.block_name = cf_sintern(block->info.block_name);
+		block->members = members;
+		// Members of consecutive blocks are tightly packed into a single array
+		members += block->info.num_members;
+	}
+
+	glGenBuffers(shader_info->num_uniform_blocks, shader_info->ubo);
+	for (int block_index = 0; block_index < uniform_info->num_uniforms; ++block_index) {
+		CF_GL_ShaderUniformBlock* block = &shader_info->uniform_blocks[block_index];
+		glBindBuffer(GL_UNIFORM_BUFFER, shader_info->ubo[block_index]);
+		glBufferData(GL_UNIFORM_BUFFER, shader_info->uniform_blocks[block_index].info.block_size, NULL, GL_DYNAMIC_DRAW);
+		// GLES 3.00 and WebGL do not support explicit binding (i.e: layout(binding = x))
+		// Thus, we have to query this after linking.
+		// The ES emitter stage-prefixes block names so both stages can each have their
+		// own uniform_block in the program's single block namespace.
+		char gl_block_name[256];
+		snprintf(gl_block_name, sizeof(gl_block_name), "%s%s", is_vs ? "cf_vs_" : "cf_fs_", block->info.block_name);
+		GLuint index = glGetUniformBlockIndex(program, gl_block_name);
+		if (index == GL_INVALID_INDEX) {
+			// The block could be optimized out
+			block->info.block_index = -1;
+			continue;
+		}
+		glUniformBlockBinding(program, index, *binding_point);
+		block->info.block_index = *binding_point;
+		++*binding_point;
+	}
+	glBindBuffer(GL_UNIFORM_BUFFER, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+CF_Shader cf_gles_make_shader_from_bytecode(CF_ShaderBytecode vertex_bytecode, CF_ShaderBytecode fragment_bytecode)
+{
+	GLuint program = s_make_program(vertex_bytecode, fragment_bytecode);
+
+	// Copy refelection data
+	CF_GL_Shader* shader = (CF_GL_Shader*)CF_CALLOC(sizeof(CF_GL_Shader));
+	shader->program = program;
+	shader->integer_attrib_mask = s_integer_attrib_mask(program);
+	static uint64_t s_shader_generation;
+	shader->generation = ++s_shader_generation;
+
+	// FS texture bindings.
+	shader->texture_bindings = (CF_GL_TextureBinding*)CF_ALLOC(sizeof(CF_GL_TextureBinding) * fragment_bytecode.shader_info.num_images);
+	for (int image_index = 0; image_index < fragment_bytecode.shader_info.num_images; ++image_index) {
+		// GLES 3.00 and WebGL do not support explicit binding (i.e: layout(binding = x))
+		// Thus, we have to query this after linking.
+		const char* image_name = fragment_bytecode.shader_info.image_names[image_index];
+		GLint location = glGetUniformLocation(program, image_name);
+		if (location < 0) { continue; }  // The image might be optimized out
+
+		shader->texture_bindings[shader->num_texture_bindings].location = location;
+		shader->texture_bindings[shader->num_texture_bindings].name = cf_sintern(image_name);
+		++shader->num_texture_bindings;
+	}
+
+	// VS texture bindings.
+	shader->vs_texture_bindings = (CF_GL_TextureBinding*)CF_ALLOC(sizeof(CF_GL_TextureBinding) * vertex_bytecode.shader_info.num_images);
+	for (int image_index = 0; image_index < vertex_bytecode.shader_info.num_images; ++image_index) {
+		const char* image_name = vertex_bytecode.shader_info.image_names[image_index];
+		GLint location = glGetUniformLocation(program, image_name);
+		if (location < 0) { continue; }
+
+		shader->vs_texture_bindings[shader->num_vs_texture_bindings].location = location;
+		shader->vs_texture_bindings[shader->num_vs_texture_bindings].name = cf_sintern(image_name);
+		++shader->num_vs_texture_bindings;
+	}
+
+	GLuint binding_point = 0;
+	s_build_uniforms(program, &shader->vs, &vertex_bytecode.shader_info, &binding_point, true);
+	s_build_uniforms(program, &shader->fs, &fragment_bytecode.shader_info, &binding_point, false);
+
+	return { (uintptr_t)(uintptr_t)shader };
+}
+
+void cf_gles_shader_swap_contents(CF_Shader a, CF_Shader b)
+{
+	// See cf_sdlgpu_shader_swap_contents: hot-reload guts swap, handles stay valid.
+	CF_GL_Shader* pa = (CF_GL_Shader*)(uintptr_t)a.id;
+	CF_GL_Shader* pb = (CF_GL_Shader*)(uintptr_t)b.id;
+	uint8_t tmp[sizeof(CF_GL_Shader)];
+	CF_MEMCPY(tmp, pa, sizeof(tmp));
+	CF_MEMCPY(pa, pb, sizeof(tmp));
+	CF_MEMCPY(pb, tmp, sizeof(tmp));
+}
+
+bool cf_gles_shader_consumes_uniform(CF_Shader shader_handle, const char* interned_name)
+{
+	CF_GL_Shader* shader = (CF_GL_Shader*)(uintptr_t)shader_handle.id;
+	const CF_GL_ShaderInfo* stages[2] = { &shader->vs, &shader->fs };
+	for (int s = 0; s < 2; ++s) {
+		for (int b = 0; b < stages[s]->num_uniform_blocks; ++b) {
+			const CF_GL_ShaderUniformBlock* block = &stages[s]->uniform_blocks[b];
+			for (int i = 0; i < block->info.num_members; ++i) {
+				if (block->members[i].name == interned_name) return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool cf_gles_shader_consumes_texture(CF_Shader shader_handle, const char* interned_name)
+{
+	CF_GL_Shader* shader = (CF_GL_Shader*)(uintptr_t)shader_handle.id;
+	for (int i = 0; i < shader->num_texture_bindings; ++i) {
+		if (shader->texture_bindings[i].name == interned_name) return true;
+	}
+	for (int i = 0; i < shader->num_vs_texture_bindings; ++i) {
+		if (shader->vs_texture_bindings[i].name == interned_name) return true;
+	}
+	return false;
+}
+
+void cf_gles_destroy_shader_internal(CF_Shader shader_handle)
+{
+	if (!shader_handle.id) return;
+
+	CF_GL_Shader* shader = (CF_GL_Shader*)(uintptr_t)shader_handle.id;
+
+	for (int i = 0; i < shader->vs.num_uniform_blocks; ++i) s_forget_buffer(shader->vs.ubo[i]);
+	for (int i = 0; i < shader->fs.num_uniform_blocks; ++i) s_forget_buffer(shader->fs.ubo[i]);
+	glDeleteBuffers(shader->vs.num_uniform_blocks, shader->vs.ubo);
+	glDeleteBuffers(shader->fs.num_uniform_blocks, shader->fs.ubo);
+
+	CF_POLL_OPENGL_ERROR();
+
+	CF_FREE(shader->vs.uniform_members);
+	CF_FREE(shader->fs.uniform_members);
+	CF_FREE(shader->texture_bindings);
+	CF_FREE(shader->vs_texture_bindings);
+	glDeleteProgram(shader->program);
+	shader->~CF_GL_Shader();
+	CF_FREE(shader);
+}
+
+static inline const CF_GL_ShaderUniformBlock* s_find_block_info(const CF_GL_ShaderInfo* shader_info, const char* name)
+{
+	for (int i = 0; i < shader_info->num_uniform_blocks; ++i) {
+		const CF_GL_ShaderUniformBlock* block = &shader_info->uniform_blocks[i];
+		if (block->info.block_name == name) {
+			return block;
+		}
+	}
+
+	return NULL;
+}
+
+static inline const CF_ShaderUniformMemberInfo* s_find_member_info(const CF_GL_ShaderUniformBlock* block, const char* name)
+{
+	for (int i = 0; i < block->info.num_members; ++i) {
+		const CF_ShaderUniformMemberInfo* member = &block->members[i];
+		if (member->name == name) {
+			return member;
+		}
+	}
+
+	return NULL;
+}
+
+static inline void s_upload_uniforms(CF_GL_ShaderInfo* shader_info, const CF_MaterialState* material, CF_Arena* arena)
+{
+	void* uniform_data_ptrs[CF_MAX_UNIFORM_BLOCK_COUNT];
+	CF_MEMSET(uniform_data_ptrs, 0, sizeof(uniform_data_ptrs));
+
+	// Copy data into uniform blocks.
+	for (int uniform_index = 0; uniform_index < material->uniforms.count(); ++uniform_index) {
+		const CF_Uniform* uniform = &material->uniforms[uniform_index];
+		const CF_GL_ShaderUniformBlock* block = s_find_block_info(shader_info, uniform->block_name);
+		if (block == NULL) { continue; }
+		if (block->info.block_index < 0) { continue; }
+
+		const CF_ShaderUniformMemberInfo* member = s_find_member_info(block, uniform->name);
+		if (member == NULL) { continue; }
+
+		CF_UniformType uniform_type = s_uniform_type(member->type);
+		CF_ASSERT(uniform_type == uniform->type);
+		CF_ASSERT(s_uniform_size(uniform_type) * member->array_length == uniform->size);
+
+		int block_index = (int)(block - shader_info->uniform_blocks);
+		void* uniform_data = uniform_data_ptrs[block_index];
+		if (uniform_data == NULL) {
+			uniform_data = cf_arena_alloc(arena, block->info.block_size);
+			CF_MEMSET(uniform_data, 0, block->info.block_size);
+			uniform_data_ptrs[block_index] = uniform_data;
+		}
+
+		CF_MEMCPY((void*)((uintptr_t)uniform_data + member->offset), uniform->data, uniform->size);
+	}
+
+	// Upload to GPU.
+	for (int block_index = 0; block_index < shader_info->num_uniform_blocks; ++block_index) {
+		const CF_GL_ShaderUniformBlock* block = &shader_info->uniform_blocks[block_index];
+		// Optimized out at link time -- the program doesn't use it, so it has no binding point.
+		if (block->info.block_index < 0) { continue; }
+
+		void* block_data = uniform_data_ptrs[block_index];
+		if (block_data == NULL) {
+			// No material uniform matched any member of this block, so phase 1 above never
+			// allocated it. glBufferData(..., NULL, ...) in s_build_uniforms left this ubo's
+			// contents unspecified (not guaranteed zero) -- upload zeros explicitly so a shader
+			// that reads an unset member gets deterministic values instead of driver-dependent
+			// garbage.
+			block_data = cf_arena_alloc(arena, block->info.block_size);
+			CF_MEMSET(block_data, 0, block->info.block_size);
+		}
+		glBindBuffer(GL_UNIFORM_BUFFER, shader_info->ubo[block_index]);
+		glBufferSubData(GL_UNIFORM_BUFFER, 0, block->info.block_size, block_data);
+		// A block the program actually uses must always have a buffer bound at its binding
+		// point, even when the material set none of its members -- WebGL2 rejects the draw
+		// otherwise ("used but unbound uniform buffer").
+		glBindBufferBase(GL_UNIFORM_BUFFER, block->info.block_index, shader_info->ubo[block_index]);
+	}
+	CF_POLL_OPENGL_ERROR();
+
+	cf_arena_reset(arena);
+}
+
+static inline void s_apply_vertex_attributes(CF_GL_Shader* shader, CF_GL_Mesh* mesh)
+{
+	s_bind_element_buffer(mesh->ibo.id ? mesh->ibo.id : 0);
+
+	uint64_t attribute_mask = 0;
+
+	if (mesh->attrib_cache_generation != shader->generation) {
+		for (int i = 0; i < mesh->attribute_count; ++i) {
+			mesh->attrib_locs[i] = glGetAttribLocation(shader->program, mesh->attributes[i].name);
+		}
+		mesh->attrib_cache_generation = shader->generation;
+	}
+
+	for (int i = 0; i < mesh->attribute_count; ++i) {
+		const CF_VertexAttribute* attrib = &mesh->attributes[i];
+		GLint loc = mesh->attrib_locs[i];
+		if (loc < 0 || loc >= 64) continue;
+
+		const bool per_instance = attrib->per_instance;
+		CF_GL_Buffer& buf = per_instance ? mesh->instance : mesh->vbo;
+		GLuint buf_id = buf.id;
+		GLsizei buf_stride = buf.stride;
+		GLintptr base_offset = per_instance ? mesh->instance.active_offset : mesh->vbo.active_offset;
+		if (per_instance && s_gl_instance_override) {
+			buf_id = s_gl_instance_override;
+			buf_stride = s_gl_instance_override_stride;
+			base_offset = s_gl_instance_override_offset;
+		}
+		if (!buf_id) continue;
+
+		GLenum type = GL_FLOAT;
+		GLint comps = 4;
+		GLboolean norm = GL_FALSE;
+		switch (attrib->format) {
+			case CF_VERTEX_FORMAT_FLOAT:	type = GL_FLOAT; comps = 1; break;
+			case CF_VERTEX_FORMAT_FLOAT2:	type = GL_FLOAT; comps = 2; break;
+			case CF_VERTEX_FORMAT_FLOAT3:	type = GL_FLOAT; comps = 3; break;
+			case CF_VERTEX_FORMAT_FLOAT4:	type = GL_FLOAT; comps = 4; break;
+			case CF_VERTEX_FORMAT_INT:	type = GL_INT; comps = 1; break;
+			case CF_VERTEX_FORMAT_INT2:	type = GL_INT; comps = 2; break;
+			case CF_VERTEX_FORMAT_INT3:	type = GL_INT; comps = 3; break;
+			case CF_VERTEX_FORMAT_INT4:	type = GL_INT; comps = 4; break;
+			case CF_VERTEX_FORMAT_UINT:	type = GL_UNSIGNED_INT; comps = 1; break;
+			case CF_VERTEX_FORMAT_UINT2:	type = GL_UNSIGNED_INT; comps = 2; break;
+			case CF_VERTEX_FORMAT_UINT3:	type = GL_UNSIGNED_INT; comps = 3; break;
+			case CF_VERTEX_FORMAT_UINT4:	type = GL_UNSIGNED_INT; comps = 4; break;
+			case CF_VERTEX_FORMAT_BYTE4:	type = GL_BYTE; comps = 4; break;
+			case CF_VERTEX_FORMAT_BYTE4_NORM:	type = GL_BYTE; comps = 4; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_UBYTE4:	type = GL_UNSIGNED_BYTE; comps = 4; break;
+			case CF_VERTEX_FORMAT_UBYTE4_NORM:	type = GL_UNSIGNED_BYTE; comps = 4; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_SHORT2:	type = GL_SHORT; comps = 2; break;
+			case CF_VERTEX_FORMAT_SHORT2_NORM:	type = GL_SHORT; comps = 2; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_SHORT4:	type = GL_SHORT; comps = 4; break;
+			case CF_VERTEX_FORMAT_SHORT4_NORM:	type = GL_SHORT; comps = 4; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_USHORT2:	type = GL_UNSIGNED_SHORT; comps = 2; break;
+			case CF_VERTEX_FORMAT_USHORT2_NORM:	type = GL_UNSIGNED_SHORT; comps = 2; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_USHORT4:	type = GL_UNSIGNED_SHORT; comps = 4; break;
+			case CF_VERTEX_FORMAT_USHORT4_NORM:	type = GL_UNSIGNED_SHORT; comps = 4; norm = GL_TRUE; break;
+			case CF_VERTEX_FORMAT_HALF2:	type = GL_HALF_FLOAT; comps = 2; break;
+			case CF_VERTEX_FORMAT_HALF4:	type = GL_HALF_FLOAT; comps = 4; break;
+			default: break;
+		}
+		if (!(g_ctx.enabled_vertex_attrib_mask & (1ULL << loc))) {
+			glEnableVertexAttribArray((GLuint)loc);
+		}
+		// Pointer and divisor are persistent per-index context state, so identical
+		// re-specification is skipped via the shadow (WebGL calls are expensive).
+		uint8_t integer = (shader->integer_attrib_mask >> loc) & 1 ? 1 : 0;
+		GLintptr ptr = (GLintptr)(attrib->offset + base_offset);
+		auto& shadow = g_ctx.attrib_shadow[loc];
+		if (shadow.buf != buf_id || shadow.ptr != ptr || shadow.stride != buf_stride || shadow.type != type
+			|| shadow.comps != (uint8_t)comps || shadow.norm != (uint8_t)norm || shadow.integer != integer) {
+			s_bind_array_buffer(buf_id);
+			const void* pointer = (const void*)(intptr_t)ptr;
+			// The shader-side input type decides the pointer flavor: integer inputs (ivec/uvec)
+			// must use IPointer regardless of the vertex format's width -- previously only GL_INT
+			// took this path, so uvec4 fed by ushort/ubyte joints read int-to-float garbage.
+			if (integer) {
+				glVertexAttribIPointer((GLuint)loc, comps, type, buf_stride, pointer);
+			} else {
+				glVertexAttribPointer((GLuint)loc, comps, type, norm, buf_stride, pointer);
+			}
+			shadow.buf = buf_id;
+			shadow.ptr = ptr;
+			shadow.stride = buf_stride;
+			shadow.type = type;
+			shadow.comps = (uint8_t)comps;
+			shadow.norm = (uint8_t)norm;
+			shadow.integer = integer;
+		}
+		uint8_t divisor = per_instance ? 1 : 0;
+		if (shadow.divisor != divisor) {
+			glVertexAttribDivisor((GLuint)loc, divisor);
+			shadow.divisor = divisor;
+		}
+
+
+		attribute_mask |= 1ULL << loc;
+	}
+
+	uint64_t disable_mask = g_ctx.enabled_vertex_attrib_mask & ~attribute_mask;
+	if (disable_mask) {
+		uint64_t mask = disable_mask;
+		for (GLuint loc = 0; mask; ++loc) {
+			if (mask & 1ULL) {
+				glDisableVertexAttribArray(loc);
+			}
+			mask >>= 1;
+		}
+	}
+
+	g_ctx.enabled_vertex_attrib_mask = attribute_mask;
+	CF_POLL_OPENGL_ERROR();
+}
+
+// Keep custom texture bindings independent of Cute's dynamic atlas/canvas filter.
+// Sampler objects avoid mutating a texture that another binding samples differently.
+static GLuint s_draw_sampler(const CF_MaterialTex& binding, CF_GL_Texture* texture)
+{
+	if (binding.sampler.id) return (GLuint)binding.sampler.id;
+	if (!g_ctx.has_filter_override || binding.name != cf_sintern("u_image")) return 0;
+	int index = g_ctx.filter_override == CF_FILTER_LINEAR;
+	GLuint& sampler = texture->draw_samplers[index];
+	if (sampler) return sampler;
+	glGenSamplers(1, &sampler);
+	CF_ASSERT(sampler);
+	GLenum filter = s_wrap(g_ctx.filter_override), min_filter = filter;
+	if (texture->has_mips) {
+		bool linear_mips = texture->min_filter == GL_LINEAR_MIPMAP_LINEAR || texture->min_filter == GL_NEAREST_MIPMAP_LINEAR;
+		min_filter = index ? (linear_mips ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST)
+		                   : (linear_mips ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
+	}
+	glSamplerParameteri(sampler, GL_TEXTURE_MIN_FILTER, min_filter);
+	glSamplerParameteri(sampler, GL_TEXTURE_MAG_FILTER, filter);
+	glSamplerParameteri(sampler, GL_TEXTURE_WRAP_S, texture->wrap_u);
+	glSamplerParameteri(sampler, GL_TEXTURE_WRAP_T, texture->wrap_v);
+	glSamplerParameteri(sampler, GL_TEXTURE_WRAP_R, texture->wrap_u);
+	if (g_ctx.anisotropy_limit > 1.0f) {
+		glSamplerParameterf(sampler, GL_TEXTURE_MAX_ANISOTROPY_EXT, texture->max_anisotropy);
+	}
+	if (texture->compare) {
+		glSamplerParameteri(sampler, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+		glSamplerParameteri(sampler, GL_TEXTURE_COMPARE_FUNC, texture->compare_func);
+	}
+	return sampler;
+}
+
+void cf_gles_apply_shader(CF_Shader shader_handle, CF_Material material_handle)
+{
+	CF_GL_Shader* shader = (CF_GL_Shader*)(uintptr_t)shader_handle.id;
+	CF_MaterialInternal* material = (CF_MaterialInternal*)(uintptr_t)material_handle.id;
+	g_ctx.material = material;
+	g_ctx.shader = shader;
+
+	// Render state.
+	CF_RenderState render_state = material->state;
+
+	// Cull. The GLSL ES transpiler emits `gl_Position.y = -gl_Position.y` so canvases come
+	// out with row 0 at the top, matching the other backends. That negation mirrors every
+	// triangle, so geometry CF considers front-facing reaches the rasterizer wound
+	// clockwise -- leaving GL at its GL_CCW default would cull exactly the wrong faces and
+	// turn solids inside out. Set unconditionally: gl_FrontFacing in shaders must be right
+	// even when culling is off.
+	glFrontFace(GL_CW);
+	if (render_state.cull_mode == CF_CULL_MODE_NONE) {
+		glDisable(GL_CULL_FACE);
+	} else {
+		glEnable(GL_CULL_FACE);
+		glCullFace(s_wrap(render_state.cull_mode));
+	}
+
+	// Depth.
+	const bool canvas_has_depth = s_canvas_has_depth(g_ctx.canvas);
+	const bool depth_test_requested = render_state.depth_write_enabled || render_state.depth_compare != CF_COMPARE_FUNCTION_ALWAYS;
+	if (canvas_has_depth && depth_test_requested) {
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(s_wrap(render_state.depth_compare));
+		glDepthMask(render_state.depth_write_enabled ? GL_TRUE : GL_FALSE);
+	} else {
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+	}
+
+	// Stencil.
+	const bool canvas_has_stencil = s_canvas_has_stencil(g_ctx.canvas);
+	g_ctx.target_state.stencil_reference = (GLint)render_state.stencil.reference;
+	g_ctx.current_state.stencil_reference = (GLint)render_state.stencil.reference;
+	if (canvas_has_stencil && render_state.stencil.enabled) {
+		glEnable(GL_STENCIL_TEST);
+		glStencilMask(render_state.stencil.write_mask);
+		glStencilFuncSeparate(GL_FRONT, s_wrap(render_state.stencil.front.compare), render_state.stencil.reference, render_state.stencil.read_mask);
+		glStencilFuncSeparate(GL_BACK, s_wrap(render_state.stencil.back.compare), render_state.stencil.reference, render_state.stencil.read_mask);
+		glStencilOpSeparate(GL_FRONT, s_wrap(render_state.stencil.front.fail_op), s_wrap(render_state.stencil.front.depth_fail_op), s_wrap(render_state.stencil.front.pass_op));
+		glStencilOpSeparate(GL_BACK, s_wrap(render_state.stencil.back.fail_op), s_wrap(render_state.stencil.back.depth_fail_op), s_wrap(render_state.stencil.back.pass_op));
+	} else {
+		glDisable(GL_STENCIL_TEST);
+		glStencilMask(0xFF);
+	}
+
+	// Blend.
+	if (render_state.blend.enabled) {
+	glEnable(GL_BLEND);
+		glColorMask(
+			render_state.blend.write_R_enabled,
+			render_state.blend.write_G_enabled,
+			render_state.blend.write_B_enabled,
+			render_state.blend.write_A_enabled
+		);
+		glBlendEquationSeparate(
+			s_wrap(render_state.blend.rgb_op),
+			s_wrap(render_state.blend.alpha_op)
+		);
+		glBlendFuncSeparate(
+			s_wrap(render_state.blend.rgb_src_blend_factor),
+			s_wrap(render_state.blend.rgb_dst_blend_factor),
+			s_wrap(render_state.blend.alpha_src_blend_factor),
+			s_wrap(render_state.blend.alpha_dst_blend_factor)
+		);
+	} else {
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+	}
+	CF_POLL_OPENGL_ERROR();
+
+	glUseProgram(shader->program);
+
+	// Uniforms.
+	s_upload_uniforms(&shader->vs, &material->vs, &material->block_arena);
+	s_upload_uniforms(&shader->fs, &material->fs, &material->block_arena);
+
+	// Textures (FS).
+	GLuint texture_unit = 0;
+	for (int texture_index = 0; texture_index < material->fs.textures.count(); ++texture_index) {
+		CF_MaterialTex material_tex = material->fs.textures[texture_index];
+		CF_GL_Texture* texture = (CF_GL_Texture*)(uintptr_t)material_tex.handle.id;
+		for (int image_index = 0; image_index < shader->num_texture_bindings; ++image_index) {
+			const CF_GL_TextureBinding* binding = &shader->texture_bindings[image_index];
+			if (binding->name == material_tex.name) {
+				CF_ASSERT((GLint)texture_unit < g_ctx.max_combined_texture_units - CF_GLES_STORAGE_TEXTURE_RESERVE);
+				glActiveTexture(GL_TEXTURE0 + texture_unit);
+				glBindTexture(texture->target, texture->id);
+				glBindSampler((GLuint)texture_unit, s_draw_sampler(material_tex, texture));
+				glUniform1i(binding->location, texture_unit);
+				++texture_unit;
+				break;
+			}
+		}
+	}
+
+	// Textures (VS).
+	for (int texture_index = 0; texture_index < material->vs.textures.count(); ++texture_index) {
+		CF_MaterialTex material_tex = material->vs.textures[texture_index];
+		CF_GL_Texture* texture = (CF_GL_Texture*)(uintptr_t)material_tex.handle.id;
+		for (int image_index = 0; image_index < shader->num_vs_texture_bindings; ++image_index) {
+			const CF_GL_TextureBinding* binding = &shader->vs_texture_bindings[image_index];
+			if (binding->name == material_tex.name) {
+				CF_ASSERT((GLint)texture_unit < g_ctx.max_combined_texture_units - CF_GLES_STORAGE_TEXTURE_RESERVE);
+				glActiveTexture(GL_TEXTURE0 + texture_unit);
+				glBindTexture(texture->target, texture->id);
+				glBindSampler((GLuint)texture_unit, s_draw_sampler(material_tex, texture));
+				glUniform1i(binding->location, texture_unit);
+				++texture_unit;
+				break;
+			}
+		}
+	}
+
+	g_ctx.has_filter_override = false;
+	CF_POLL_OPENGL_ERROR();
+
+	CF_GL_Mesh* mesh = g_ctx.mesh;
+	CF_ASSERT(mesh != NULL);
+
+	s_apply_vertex_attributes(shader, mesh);
+}
+
+static void s_fence_ring_slot(CF_GL_Ring& ring, int active_slot)
+{
+	if (active_slot >= 0 && active_slot < ring.count) s_set_slot_fence(ring.slots[active_slot]);
+}
+
+// Every draw marks the ring slots it reads busy, so the next upload to them takes another slot.
+static void s_fence_draw_inputs(CF_GL_Mesh* mesh, CF_MaterialInternal* material)
+{
+	s_fence_ring_slot(mesh->vbo.ring, mesh->vbo.active_slot);
+	s_fence_ring_slot(mesh->ibo.ring, mesh->ibo.active_slot);
+	s_fence_ring_slot(mesh->instance.ring, mesh->instance.active_slot);
+	CF_MaterialState* stages[2] = { &material->vs, &material->fs };
+	for (int s = 0; s < 2; ++s) {
+		for (int i = 0; i < stages[s]->textures.count(); ++i) {
+			CF_GL_Texture* texture = (CF_GL_Texture*)(uintptr_t)stages[s]->textures[i].handle.id;
+			if (texture) s_fence_ring_slot(texture->ring, texture->active_slot);
+		}
+	}
+}
+
+void cf_gles_draw_elements()
+{
+	CF_GL_Mesh* mesh = g_ctx.mesh;
+	CF_MaterialInternal* material = g_ctx.material;
+	CF_ASSERT(mesh != NULL);
+	CF_ASSERT(material != NULL);
+
+	s_apply_state();
+	s_apply_storage_textures(); // Emulated storage binds for every draw kind, not just pull instancing.
+
+	GLenum prim = s_wrap(material->state.primitive_type);
+	int instance_count = (mesh->instance.id && mesh->instance.count > 0) ? mesh->instance.count : 0;
+	if (s_gl_instance_override) {
+		instance_count = s_gl_instance_override_count;
+		s_gl_instance_override = 0; // One draw only.
+	}
+
+
+
+	if (mesh->ibo.id && mesh->ibo.count > 0) {
+		GLenum elem = (mesh->ibo.stride == 2) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+		if (instance_count > 0) {
+			glDrawElementsInstanced(prim, mesh->ibo.count, elem, (const void*)(intptr_t)mesh->ibo.active_offset, instance_count);
+		} else {
+			glDrawElements(prim, mesh->ibo.count, elem, (const void*)(intptr_t)mesh->ibo.active_offset);
+		}
+	} else if (mesh->vbo.count > 0) {
+		if (instance_count > 0) {
+			glDrawArraysInstanced(prim, 0, mesh->vbo.count, instance_count);
+		} else {
+			glDrawArrays(prim, 0, mesh->vbo.count);
+		}
+	}
+
+	s_fence_draw_inputs(mesh, material);
+
+	CF_POLL_OPENGL_ERROR();
+	++app->draw_call_count;
+	g_ctx.target_state = s_default_state(g_ctx.canvas);
+}
+
+void cf_gles_draw_elements_range(int first_element, int element_count, int instance_count)
+{
+	CF_GL_Mesh* mesh = g_ctx.mesh;
+	CF_MaterialInternal* material = g_ctx.material;
+	CF_ASSERT(mesh != NULL);
+	CF_ASSERT(material != NULL);
+
+	s_apply_state();
+	s_apply_storage_textures(); // Emulated storage binds for every draw kind, not just pull instancing.
+
+	// Attribute pointers bind at apply-shader time; a pending override means this draw sources
+	// a different instance slice, so rebind against the last applied shader.
+	if (s_gl_instance_override && g_ctx.shader) s_apply_vertex_attributes(g_ctx.shader, mesh);
+
+	GLenum prim = s_wrap(material->state.primitive_type);
+	int ninst = instance_count;
+	if (ninst <= 0) {
+		if (s_gl_instance_override) ninst = s_gl_instance_override_count;
+		else if (mesh->instance.id && mesh->instance.count > 0) ninst = mesh->instance.count;
+		else ninst = 0;
+	}
+	s_gl_instance_override = 0; // One draw only, same contract as cf_gles_draw_elements.
+
+	if (mesh->ibo.id && mesh->ibo.count > 0) {
+		GLenum elem = (mesh->ibo.stride == 2) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+		int count = element_count >= 0 ? element_count : mesh->ibo.count;
+		const void* offset = (const void*)(intptr_t)(mesh->ibo.active_offset + first_element * mesh->ibo.stride);
+		if (ninst > 0) {
+			glDrawElementsInstanced(prim, count, elem, offset, ninst);
+		} else {
+			glDrawElements(prim, count, elem, offset);
+		}
+	} else {
+		int count = element_count >= 0 ? element_count : mesh->vbo.count;
+		if (ninst > 0) {
+			glDrawArraysInstanced(prim, first_element, count, ninst);
+		} else {
+			glDrawArrays(prim, first_element, count);
+		}
+	}
+
+	s_fence_draw_inputs(mesh, material);
+
+	CF_POLL_OPENGL_ERROR();
+	++app->draw_call_count;
+	g_ctx.target_state = s_default_state(g_ctx.canvas);
+}
+
+void cf_gles_apply_viewport(int x, int y, int w, int h)
+{
+	g_ctx.target_state.viewport = { x, y, w, h };
+}
+
+void cf_gles_apply_scissor(int x, int y, int w, int h)
+{
+	g_ctx.target_state.scissor_enabled = true;
+	g_ctx.target_state.scissor = { x, y, w, h };
+}
+
+void cf_gles_apply_stencil_reference(int reference)
+{
+	g_ctx.target_state.stencil_reference = reference;
+}
+
+void cf_gles_apply_blend_constants(float r, float g, float b, float a)
+{
+	g_ctx.target_state.blend_constants = { r, g, b, a };
+}
+
+void* cf_gles_create_draw_sampler(CF_Filter filter)
+{
+	// Zero means no override, so encode NEAREST as one.
+	return (void*)((uintptr_t)filter + 1);
+}
+
+void cf_gles_destroy_draw_sampler(void* sampler)
+{
+	CF_UNUSED(sampler); // Filtered sampler variants belong to their textures.
+}
+
+void cf_gles_set_sampler_override(void* sampler)
+{
+	g_ctx.has_filter_override = sampler != NULL;
+	if (sampler) g_ctx.filter_override = (CF_Filter)((uintptr_t)sampler - 1);
+}
+
+// GLES3 has no SSBOs, so CF_StorageBuffer is emulated as a 1024-wide RGBA32UI texture:
+// one texel per vec4, row-major (shader side indexes ivec2(i & 1023, i >> 10) -- see
+// s_inst_vs_access_gles in builtin_shaders.h). Slower than real storage buffers, which
+// is fine: GLES runs the instanced path only.
+
+#define CF_GLES_STORAGE_WIDTH 1024
+
+struct CF_GL_StorageBuffer
+{
+	GLuint tex = 0;
+	int height = 0; // Allocated texture height in rows of CF_GLES_STORAGE_WIDTH texels.
+};
+
+static void s_storage_realloc(CF_GL_StorageBuffer* b, int texels)
+{
+	int height = (texels + CF_GLES_STORAGE_WIDTH - 1) / CF_GLES_STORAGE_WIDTH;
+	if (height < 1) height = 1;
+	if (b->tex && height <= b->height) return;
+	if (b->tex) glDeleteTextures(1, &b->tex);
+	glGenTextures(1, &b->tex);
+	glBindTexture(GL_TEXTURE_2D, b->tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, CF_GLES_STORAGE_WIDTH, height, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	b->height = height;
+	CF_POLL_OPENGL_ERROR();
+}
+
+CF_StorageBuffer cf_gles_make_storage_buffer(CF_StorageBufferParams params)
+{
+	CF_GL_StorageBuffer* b = CF_NEW(CF_GL_StorageBuffer);
+	s_storage_realloc(b, (params.size + 15) / 16);
+	CF_StorageBuffer result = { (uint64_t)(uintptr_t)b };
+	return result;
+}
+
+void cf_gles_update_storage_buffer(CF_StorageBuffer buffer, const void* data, int size)
+{
+	CF_GL_StorageBuffer* b = (CF_GL_StorageBuffer*)(uintptr_t)buffer.id;
+	if (!b || size <= 0) return;
+	int texels = (size + 15) / 16; // All CF uploads are vec4-granular.
+	// Bind on unit 0 explicitly: binding on whatever unit happens to be active would
+	// silently clobber a unit the current program's samplers point at.
+	glActiveTexture(GL_TEXTURE0);
+	s_storage_realloc(b, texels);
+	glBindTexture(GL_TEXTURE_2D, b->tex);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	int full_rows = texels / CF_GLES_STORAGE_WIDTH;
+	int rem = texels % CF_GLES_STORAGE_WIDTH;
+	const uint8_t* src = (const uint8_t*)data;
+	if (full_rows) {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, CF_GLES_STORAGE_WIDTH, full_rows, GL_RGBA_INTEGER, GL_UNSIGNED_INT, src);
+	}
+	if (rem) {
+		// The final partial row; pad the last partial texel if the size isn't 16-aligned.
+		uint32_t staging[CF_GLES_STORAGE_WIDTH * 4];
+		int row_bytes = size - full_rows * CF_GLES_STORAGE_WIDTH * 16;
+		CF_MEMSET(staging, 0, rem * 16);
+		CF_MEMCPY(staging, src + full_rows * CF_GLES_STORAGE_WIDTH * 16, row_bytes);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, full_rows, rem, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, staging);
+	}
+	glBindTexture(GL_TEXTURE_2D, 0);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_destroy_storage_buffer(CF_StorageBuffer buffer)
+{
+	CF_GL_StorageBuffer* b = (CF_GL_StorageBuffer*)(uintptr_t)buffer.id;
+	if (!b) return;
+	if (b->tex) glDeleteTextures(1, &b->tex);
+	CF_FREE(b);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Compute, emulated. GLES3/WebGL2 has no compute stage, so a dispatch of T invocations runs as
+// draws (see the compute paragraphs in cute_graphics.h for the user-facing limits):
+//
+//   CAPTURE: the compute shader, transpiled by cute_spirv into a fragment shader, runs one
+//   fragment per invocation over a W x H "invocation grid". Each write site of the source
+//   (an imageStore, an assignment into a storage buffer element) is numbered; a uniform picks
+//   the active site, whose write is captured into two outputs -- the value as raw words, and
+//   (x, y, first component, valid) of its destination texel -- instead of performed. One
+//   capture draw per site, each into its own scratch pair.
+//   SCATTER: per site, T points drawn into the destination texture (a storage image, or the
+//   RGBA32UI texture backing an emulated storage buffer); each point reads its invocation's
+//   captured target and lands on that texel, or clips away. A partial-texel buffer write
+//   (1 or 2 words) is drawn once per first-component class under a color mask.
+//
+// Every capture runs before any scatter, so all reads see the pre-dispatch contents, as with
+// real compute: no site sees another site's writes from the same dispatch.
+
+struct CF_GL_ComputeSite
+{
+	CF_ShaderWriteKind kind;
+	int words;
+	int dest_index; // Into the dispatch's rw_textures or rw_buffers.
+};
+
+struct CF_GL_ComputeResource
+{
+	GLint loc;      // The capture program's sampler for it, or -1 when the program never reads it.
+	bool readonly;
+	int index;      // Into the dispatch's ro_* or rw_* array.
+};
+
+struct CF_GL_ComputeShader
+{
+	GLuint program;
+	int local_size[3];
+	int num_sites;
+	CF_GL_ComputeSite* sites;
+	int num_buffers;                    // Rank order: readonly (set 0) then read-write (set 1), by binding.
+	CF_GL_ComputeResource* buffers;
+	int num_images;
+	CF_GL_ComputeResource* images;
+	int num_texture_bindings;
+	CF_GL_TextureBinding* texture_bindings;
+	CF_GL_ShaderInfo cs;
+	GLint loc_site, loc_groups, loc_grid_w;
+};
+
+struct CF_GL_ComputeScratch
+{
+	GLuint fbo = 0;
+	GLuint values = 0;  // RGBA32UI: the captured value, as raw 32-bit words.
+	GLuint targets = 0; // RGBA32I: (x, y, first component, valid).
+	int w = 0, h = 0;
+};
+
+static struct
+{
+	bool ready;
+	GLuint vao;            // Compute's own, empty: draws without attributes, the draw path's default VAO untouched.
+	GLuint dest_fbo;
+	GLuint nearest;        // A sampler object: texelFetch on integer textures wants a complete, unfiltered texture.
+	GLuint scatter[3];     // Destination type: 0 float, 1 uint, 2 int.
+	GLint scatter_loc_values[3], scatter_loc_targets[3], scatter_loc_grid_w[3], scatter_loc_component[3], scatter_loc_dest_size[3];
+	GLuint capture_vs;     // The full-screen triangle every capture program links.
+	int max_grid;
+	Cute::Array<CF_GL_ComputeScratch> scratch;
+} s_cs;
+
+static const char* s_cs_capture_vs =
+	"#version 300 es\n"
+	"void main() {\n"
+	"	vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+	"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+static const char* s_cs_scatter_vs =
+	"#version 300 es\n"
+	"precision highp float; precision highp int; precision highp usampler2D; precision highp isampler2D;\n"
+	"uniform highp usampler2D u_cspv_values;\n"
+	"uniform highp isampler2D u_cspv_targets;\n"
+	"uniform int u_cspv_grid_w;\n"
+	"uniform int u_cspv_component;\n"
+	"uniform ivec2 u_cspv_dest_size;\n"
+	"flat out highp uvec4 v_value;\n"
+	"void main() {\n"
+	"	ivec2 p = ivec2(gl_VertexID % u_cspv_grid_w, gl_VertexID / u_cspv_grid_w);\n"
+	"	ivec4 t = texelFetch(u_cspv_targets, p, 0);\n"
+	"	v_value = texelFetch(u_cspv_values, p, 0);\n"
+	"	gl_PointSize = 1.0;\n"
+	"	if (t.w == 0 || t.z != u_cspv_component || t.x < 0 || t.y < 0 || t.x >= u_cspv_dest_size.x || t.y >= u_cspv_dest_size.y) {\n"
+	"		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+	"		return;\n"
+	"	}\n"
+	"	vec2 ndc = (vec2(t.xy) + 0.5) / vec2(u_cspv_dest_size) * 2.0 - 1.0;\n"
+	"	gl_Position = vec4(ndc, 0.0, 1.0);\n"
+	"}\n";
+
+static const char* s_cs_scatter_fs[3] = {
+	"#version 300 es\n"
+	"precision highp float; precision highp int;\n"
+	"flat in highp uvec4 v_value;\n"
+	"layout(location = 0) out highp vec4 o;\n"
+	"void main() { o = uintBitsToFloat(v_value); }\n",
+
+	"#version 300 es\n"
+	"precision highp float; precision highp int;\n"
+	"flat in highp uvec4 v_value;\n"
+	"layout(location = 0) out highp uvec4 o;\n"
+	"void main() { o = v_value; }\n",
+
+	"#version 300 es\n"
+	"precision highp float; precision highp int;\n"
+	"flat in highp uvec4 v_value;\n"
+	"layout(location = 0) out highp ivec4 o;\n"
+	"void main() { o = ivec4(v_value); }\n",
+};
+
+static GLuint s_cs_link(GLuint vs, const char* fs_src, int fs_len)
+{
+	GLuint fs = s_compile_shader(GL_FRAGMENT_SHADER, fs_src, fs_len);
+	GLint compiled = GL_FALSE;
+	glGetShaderiv(fs, GL_COMPILE_STATUS, &compiled);
+	if (!compiled) { glDeleteShader(fs); return 0; }
+	GLuint program = glCreateProgram();
+	glAttachShader(program, vs);
+	glAttachShader(program, fs);
+	glLinkProgram(program);
+	glDetachShader(program, vs);
+	glDetachShader(program, fs);
+	glDeleteShader(fs);
+	GLint ok = GL_FALSE;
+	glGetProgramiv(program, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char log[4096]; GLsizei len = 0;
+		glGetProgramInfoLog(program, sizeof(log), &len, log);
+		fprintf(stderr, "GLSL link error (compute):\n%.*s\n", (int)len, log);
+		glDeleteProgram(program);
+		return 0;
+	}
+	return program;
+}
+
+static bool s_cs_init()
+{
+	if (s_cs.ready) return true;
+	glGenVertexArrays(1, &s_cs.vao);
+	glGenFramebuffers(1, &s_cs.dest_fbo);
+	glGenSamplers(1, &s_cs.nearest);
+	glSamplerParameteri(s_cs.nearest, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glSamplerParameteri(s_cs.nearest, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glSamplerParameteri(s_cs.nearest, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glSamplerParameteri(s_cs.nearest, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	s_cs.capture_vs = s_compile_shader(GL_VERTEX_SHADER, s_cs_capture_vs, (int)CF_STRLEN(s_cs_capture_vs));
+	GLuint scatter_vs = s_compile_shader(GL_VERTEX_SHADER, s_cs_scatter_vs, (int)CF_STRLEN(s_cs_scatter_vs));
+	for (int i = 0; i < 3; ++i) {
+		s_cs.scatter[i] = s_cs_link(scatter_vs, s_cs_scatter_fs[i], (int)CF_STRLEN(s_cs_scatter_fs[i]));
+		if (!s_cs.scatter[i]) { glDeleteShader(scatter_vs); return false; }
+		s_cs.scatter_loc_values[i] = glGetUniformLocation(s_cs.scatter[i], "u_cspv_values");
+		s_cs.scatter_loc_targets[i] = glGetUniformLocation(s_cs.scatter[i], "u_cspv_targets");
+		s_cs.scatter_loc_grid_w[i] = glGetUniformLocation(s_cs.scatter[i], "u_cspv_grid_w");
+		s_cs.scatter_loc_component[i] = glGetUniformLocation(s_cs.scatter[i], "u_cspv_component");
+		s_cs.scatter_loc_dest_size[i] = glGetUniformLocation(s_cs.scatter[i], "u_cspv_dest_size");
+	}
+	glDeleteShader(scatter_vs);
+	GLint max_tex = 0, max_vp[2] = { 0, 0 };
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+	glGetIntegerv(GL_MAX_VIEWPORT_DIMS, max_vp);
+	int m = max_tex;
+	if (max_vp[0] < m) m = max_vp[0];
+	if (max_vp[1] < m) m = max_vp[1];
+	s_cs.max_grid = 1;
+	while (s_cs.max_grid * 2 <= m && s_cs.max_grid < 4096) s_cs.max_grid *= 2;
+	s_cs.ready = true;
+	CF_POLL_OPENGL_ERROR();
+	return true;
+}
+
+static GLuint s_cs_int_texture(GLenum internal_fmt, GLenum fmt, GLenum type, int w, int h)
+{
+	GLuint t = 0;
+	glGenTextures(1, &t);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, w, h, 0, fmt, type, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	return t;
+}
+
+// Site k's scratch pair, at least w x h.
+static CF_GL_ComputeScratch* s_cs_scratch(int k, int w, int h)
+{
+	while (s_cs.scratch.count() <= k) s_cs.scratch.add(CF_GL_ComputeScratch());
+	CF_GL_ComputeScratch* s = &s_cs.scratch[k];
+	if (s->fbo && s->w >= w && s->h >= h) return s;
+	if (s->fbo) {
+		glDeleteFramebuffers(1, &s->fbo);
+		glDeleteTextures(1, &s->values);
+		glDeleteTextures(1, &s->targets);
+	}
+	int nw = s->w > w ? s->w : w, nh = s->h > h ? s->h : h;
+	glActiveTexture(GL_TEXTURE0);
+	s->values = s_cs_int_texture(GL_RGBA32UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nw, nh);
+	s->targets = s_cs_int_texture(GL_RGBA32I, GL_RGBA_INTEGER, GL_INT, nw, nh);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glGenFramebuffers(1, &s->fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->values, 0);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, s->targets, 0);
+	GLenum bufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+	glDrawBuffers(2, bufs);
+	s->w = nw;
+	s->h = nh;
+	return s;
+}
+
+static int s_cs_resource_cmp_key(const CF_ShaderResourceInfo* r) { return r->set * 4096 + r->binding; }
+
+// Resources of one class ordered as CF_ComputeDispatch's arrays order them: readonly (set 0)
+// before read-write (set 1), each by binding. `order` receives indices into `items`.
+static void s_cs_order(const CF_ShaderResourceInfo* items, int count, int* order)
+{
+	for (int i = 0; i < count; ++i) order[i] = i;
+	for (int i = 0; i < count; ++i) {
+		for (int j = i + 1; j < count; ++j) {
+			if (s_cs_resource_cmp_key(&items[order[j]]) < s_cs_resource_cmp_key(&items[order[i]])) {
+				int t = order[i]; order[i] = order[j]; order[j] = t;
+			}
+		}
+	}
+}
+
+CF_ComputeShader cf_gles_make_compute_shader_from_bytecode(CF_ShaderBytecode bytecode)
+{
+	CF_ComputeShader result = { 0 };
+	const CF_ShaderInfo* info = &bytecode.shader_info;
+	if (!bytecode.glsl300_src) {
+		fprintf(stderr, "Compute shader has no GLSL ES output; it cannot run on GLES3.\n");
+		return result;
+	}
+	if (!s_cs_init()) return result;
+	GLuint program = s_cs_link(s_cs.capture_vs, bytecode.glsl300_src, (int)bytecode.glsl300_src_size);
+	if (!program) return result;
+
+	CF_GL_ComputeShader* cs = (CF_GL_ComputeShader*)CF_CALLOC(sizeof(CF_GL_ComputeShader));
+	cs->program = program;
+	for (int i = 0; i < 3; ++i) cs->local_size[i] = info->local_size[i] > 0 ? info->local_size[i] : 1;
+	cs->loc_site = glGetUniformLocation(program, "u_cspv_site");
+	cs->loc_groups = glGetUniformLocation(program, "u_cspv_groups");
+	cs->loc_grid_w = glGetUniformLocation(program, "u_cspv_grid_w");
+
+	// Storage buffers, in rank order: the capture shader reads buffer r through u_cs_storage_<r>.
+	int nb = info->num_storage_buffer_infos;
+	int* border = (int*)CF_ALLOC(sizeof(int) * (nb > 0 ? nb : 1));
+	s_cs_order(info->storage_buffer_infos, nb, border);
+	cs->num_buffers = nb;
+	cs->buffers = (CF_GL_ComputeResource*)CF_CALLOC(sizeof(CF_GL_ComputeResource) * (nb > 0 ? nb : 1));
+	int ro_count = 0, rw_count = 0;
+	for (int r = 0; r < nb; ++r) {
+		const CF_ShaderResourceInfo* it = &info->storage_buffer_infos[border[r]];
+		char name[32];
+		snprintf(name, sizeof(name), "u_cs_storage_%d", r);
+		cs->buffers[r].loc = glGetUniformLocation(program, name);
+		cs->buffers[r].readonly = it->readonly;
+		cs->buffers[r].index = it->readonly ? ro_count++ : rw_count++;
+	}
+
+	// Storage images: read (imageLoad) through a sampler of the same name, when the program does.
+	int ni = info->num_storage_image_infos;
+	int* iorder = (int*)CF_ALLOC(sizeof(int) * (ni > 0 ? ni : 1));
+	s_cs_order(info->storage_image_infos, ni, iorder);
+	cs->num_images = ni;
+	cs->images = (CF_GL_ComputeResource*)CF_CALLOC(sizeof(CF_GL_ComputeResource) * (ni > 0 ? ni : 1));
+	int ro_img = 0, rw_img = 0;
+	for (int r = 0; r < ni; ++r) {
+		const CF_ShaderResourceInfo* it = &info->storage_image_infos[iorder[r]];
+		cs->images[r].loc = glGetUniformLocation(program, it->name);
+		cs->images[r].readonly = it->readonly;
+		cs->images[r].index = it->readonly ? ro_img++ : rw_img++;
+	}
+
+	// Write sites: each one's destination in the dispatch's read-write arrays.
+	cs->num_sites = info->num_write_sites;
+	cs->sites = (CF_GL_ComputeSite*)CF_CALLOC(sizeof(CF_GL_ComputeSite) * (cs->num_sites > 0 ? cs->num_sites : 1));
+	for (int k = 0; k < cs->num_sites; ++k) {
+		const CF_ShaderWriteSite* w = &info->write_sites[k];
+		CF_GL_ComputeSite* site = &cs->sites[k];
+		site->kind = w->kind;
+		site->words = w->kind == CF_SHADER_WRITE_KIND_IMAGE ? 4 : w->words;
+		site->dest_index = -1;
+		const CF_ShaderResourceInfo* list = w->kind == CF_SHADER_WRITE_KIND_IMAGE ? info->storage_image_infos : info->storage_buffer_infos;
+		int* order = w->kind == CF_SHADER_WRITE_KIND_IMAGE ? iorder : border;
+		int n = w->kind == CF_SHADER_WRITE_KIND_IMAGE ? ni : nb;
+		CF_GL_ComputeResource* res = w->kind == CF_SHADER_WRITE_KIND_IMAGE ? cs->images : cs->buffers;
+		for (int r = 0; r < n; ++r) {
+			const CF_ShaderResourceInfo* it = &list[order[r]];
+			if (it->set == w->set && it->binding == w->binding) { site->dest_index = res[r].index; break; }
+		}
+		if (site->dest_index < 0) fprintf(stderr, "Compute shader write site %d (%s) names no read-write resource.\n", k, w->name);
+	}
+	CF_FREE(border);
+	CF_FREE(iorder);
+
+	// Sampled textures, bound like a fragment shader's.
+	cs->texture_bindings = (CF_GL_TextureBinding*)CF_ALLOC(sizeof(CF_GL_TextureBinding) * (info->num_images > 0 ? info->num_images : 1));
+	for (int i = 0; i < info->num_images; ++i) {
+		GLint loc = glGetUniformLocation(program, info->image_names[i]);
+		if (loc < 0) continue;
+		cs->texture_bindings[cs->num_texture_bindings].location = loc;
+		cs->texture_bindings[cs->num_texture_bindings].name = cf_sintern(info->image_names[i]);
+		++cs->num_texture_bindings;
+	}
+
+	// Uniform blocks carry the fragment stage's prefix: the capture pass is a fragment shader.
+	GLuint binding_point = 0;
+	s_build_uniforms(program, &cs->cs, info, &binding_point, false);
+	CF_POLL_OPENGL_ERROR();
+	result.id = (uint64_t)(uintptr_t)cs;
+	return result;
+}
+
+void cf_gles_destroy_compute_shader(CF_ComputeShader shader)
+{
+	CF_GL_ComputeShader* cs = (CF_GL_ComputeShader*)(uintptr_t)shader.id;
+	if (!cs) return;
+	for (int i = 0; i < cs->cs.num_uniform_blocks; ++i) s_forget_buffer(cs->cs.ubo[i]);
+	glDeleteBuffers(cs->cs.num_uniform_blocks, cs->cs.ubo);
+	CF_FREE(cs->cs.uniform_members);
+	CF_FREE(cs->sites);
+	CF_FREE(cs->buffers);
+	CF_FREE(cs->images);
+	CF_FREE(cs->texture_bindings);
+	glDeleteProgram(cs->program);
+	CF_FREE(cs);
+}
+
+void cf_gles_compute_shader_swap_contents(CF_ComputeShader a, CF_ComputeShader b)
+{
+	// Hot reload: the guts swap, the handles stay valid.
+	CF_GL_ComputeShader* pa = (CF_GL_ComputeShader*)(uintptr_t)a.id;
+	CF_GL_ComputeShader* pb = (CF_GL_ComputeShader*)(uintptr_t)b.id;
+	if (!pa || !pb) return;
+	CF_GL_ComputeShader tmp = *pa;
+	*pa = *pb;
+	*pb = tmp;
+}
+
+// Compute uniforms match by member name across every block, as on SDL_GPU: the material files
+// them all under the default block name, while a compute shader names its blocks freely.
+static void s_cs_upload_uniforms(CF_GL_ShaderInfo* shader_info, const CF_MaterialState* material, CF_Arena* arena)
+{
+	void* data[CF_MAX_UNIFORM_BLOCK_COUNT] = { };
+	for (int block_index = 0; block_index < shader_info->num_uniform_blocks; ++block_index) {
+		const CF_GL_ShaderUniformBlock* block = &shader_info->uniform_blocks[block_index];
+		if (block->info.block_index < 0) continue;
+		data[block_index] = cf_arena_alloc(arena, block->info.block_size);
+		CF_MEMSET(data[block_index], 0, block->info.block_size);
+		for (int i = 0; i < material->uniforms.count(); ++i) {
+			const CF_Uniform* uniform = &material->uniforms[i];
+			const CF_ShaderUniformMemberInfo* member = s_find_member_info(block, uniform->name);
+			if (!member) continue;
+			CF_ASSERT(s_uniform_type(member->type) == uniform->type);
+			CF_ASSERT(s_uniform_size(uniform->type) * member->array_length == uniform->size);
+			CF_MEMCPY((void*)((uintptr_t)data[block_index] + member->offset), uniform->data, uniform->size);
+		}
+		glBindBuffer(GL_UNIFORM_BUFFER, shader_info->ubo[block_index]);
+		glBufferSubData(GL_UNIFORM_BUFFER, 0, block->info.block_size, data[block_index]);
+		glBindBufferBase(GL_UNIFORM_BUFFER, block->info.block_index, shader_info->ubo[block_index]);
+	}
+	CF_POLL_OPENGL_ERROR();
+	cf_arena_reset(arena);
+}
+
+// How a destination texture stores what the scatter writes: 0 float (incl. normalized), 1 uint, 2 int.
+static int s_cs_dest_type(GLenum internal_fmt)
+{
+	switch (internal_fmt) {
+	case GL_R8UI: case GL_RG8UI: case GL_RGBA8UI: case GL_R16UI: case GL_RG16UI: case GL_RGBA16UI:
+	case GL_R32UI: case GL_RG32UI: case GL_RGBA32UI: case GL_RGB10_A2UI:
+		return 1;
+	case GL_R8I: case GL_RG8I: case GL_RGBA8I: case GL_R16I: case GL_RG16I: case GL_RGBA16I:
+	case GL_R32I: case GL_RG32I: case GL_RGBA32I:
+		return 2;
+	default:
+		return 0;
+	}
+}
+
+void cf_gles_dispatch_compute(CF_ComputeShader shader, CF_Material material_handle, CF_ComputeDispatch dispatch)
+{
+	CF_GL_ComputeShader* cs = (CF_GL_ComputeShader*)(uintptr_t)shader.id;
+	CF_MaterialInternal* material = (CF_MaterialInternal*)(uintptr_t)material_handle.id;
+	if (!cs || !cs->program || !s_cs.ready) return;
+	int gx = dispatch.group_count_x, gy = dispatch.group_count_y, gz = dispatch.group_count_z;
+	if (gx <= 0 || gy <= 0 || gz <= 0) return;
+	int64_t total = (int64_t)gx * cs->local_size[0] * gy * cs->local_size[1] * gz * cs->local_size[2];
+	if (total <= 0) return;
+	int grid_w = 1;
+	while (grid_w < total && grid_w < s_cs.max_grid) grid_w *= 2;
+	int64_t grid_h = (total + grid_w - 1) / grid_w;
+	if (grid_h > s_cs.max_grid || total > 0x7fffffff) {
+		fprintf(stderr, "Compute dispatch of %lld invocations exceeds the GLES grid (%d x %d); skipped.\n", (long long)total, s_cs.max_grid, s_cs.max_grid);
+		return;
+	}
+	int T = (int)total;
+
+	// Everything below is restored on the way out: the draw path caches some of it.
+	GLint prev_program = 0, prev_vao = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
+	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+	GLboolean prev_mask[4];
+	glGetBooleanv(GL_COLOR_WRITEMASK, prev_mask);
+	GLboolean prev_blend = glIsEnabled(GL_BLEND), prev_depth = glIsEnabled(GL_DEPTH_TEST);
+	GLboolean prev_stencil = glIsEnabled(GL_STENCIL_TEST), prev_cull = glIsEnabled(GL_CULL_FACE);
+	GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glBindVertexArray(s_cs.vao);
+
+	// Scratch pairs first: growing the list moves them.
+	for (int k = cs->num_sites - 1; k >= 0; --k) s_cs_scratch(k, grid_w, (int)grid_h);
+
+	// CAPTURE.
+	glUseProgram(cs->program);
+	s_cs_upload_uniforms(&cs->cs, &material->cs, &material->block_arena);
+	GLuint unit = 0;
+	for (int i = 0; i < material->cs.textures.count(); ++i) {
+		CF_MaterialTex material_tex = material->cs.textures[i];
+		CF_GL_Texture* texture = (CF_GL_Texture*)(uintptr_t)material_tex.handle.id;
+		if (!texture) continue;
+		for (int b = 0; b < cs->num_texture_bindings; ++b) {
+			if (cs->texture_bindings[b].name != material_tex.name) continue;
+			glActiveTexture(GL_TEXTURE0 + unit);
+			glBindTexture(texture->target, texture->id);
+			glBindSampler(unit, s_draw_sampler(material_tex, texture));
+			glUniform1i(cs->texture_bindings[b].location, (GLint)unit);
+			++unit;
+			break;
+		}
+	}
+	GLuint top = (GLuint)(g_ctx.max_combined_texture_units - 1);
+	GLuint lowest_top = top + 1;
+	for (int r = 0; r < cs->num_buffers; ++r) {
+		CF_GL_ComputeResource* res = &cs->buffers[r];
+		if (res->loc < 0) continue;
+		CF_StorageBuffer* list = res->readonly ? dispatch.ro_buffers : dispatch.rw_buffers;
+		int count = res->readonly ? dispatch.ro_buffer_count : dispatch.rw_buffer_count;
+		if (res->index >= count) continue;
+		CF_GL_StorageBuffer* b = (CF_GL_StorageBuffer*)(uintptr_t)list[res->index].id;
+		if (!b || top < unit) continue;
+		glActiveTexture(GL_TEXTURE0 + top);
+		glBindTexture(GL_TEXTURE_2D, b->tex);
+		glBindSampler(top, 0);
+		glUniform1i(res->loc, (GLint)top);
+		lowest_top = top--;
+	}
+	for (int r = 0; r < cs->num_images; ++r) {
+		CF_GL_ComputeResource* res = &cs->images[r];
+		if (res->loc < 0) continue;
+		CF_Texture* list = res->readonly ? dispatch.ro_textures : dispatch.rw_textures;
+		int count = res->readonly ? dispatch.ro_texture_count : dispatch.rw_texture_count;
+		if (res->index >= count) continue;
+		CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)list[res->index].id;
+		if (!t || top < unit) continue;
+		glActiveTexture(GL_TEXTURE0 + top);
+		glBindTexture(t->target, t->id);
+		glBindSampler(top, s_cs.nearest);
+		glUniform1i(res->loc, (GLint)top);
+		lowest_top = top--;
+	}
+	if (cs->loc_groups >= 0) glUniform3i(cs->loc_groups, gx, gy, gz);
+	if (cs->loc_grid_w >= 0) glUniform1i(cs->loc_grid_w, grid_w);
+	glViewport(0, 0, grid_w, (GLsizei)grid_h);
+	for (int k = 0; k < cs->num_sites; ++k) {
+		glBindFramebuffer(GL_FRAMEBUFFER, s_cs.scratch[k].fbo);
+		if (cs->loc_site >= 0) glUniform1i(cs->loc_site, k);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+	}
+	CF_POLL_OPENGL_ERROR();
+
+	// SCATTER. The capture samplers' units are released first: a destination still bound for
+	// reading while rendered into is a feedback loop.
+	for (GLuint u = lowest_top; u < (GLuint)g_ctx.max_combined_texture_units; ++u) {
+		glActiveTexture(GL_TEXTURE0 + u);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindSampler(u, 0);
+	}
+	for (GLuint u = 0; u < unit; ++u) {
+		glActiveTexture(GL_TEXTURE0 + u);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+		glBindTexture(GL_TEXTURE_3D, 0);
+		glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+		glBindSampler(u, 0);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, s_cs.dest_fbo);
+	GLenum buf0 = GL_COLOR_ATTACHMENT0;
+	glDrawBuffers(1, &buf0);
+	for (int k = 0; k < cs->num_sites; ++k) {
+		const CF_GL_ComputeSite* site = &cs->sites[k];
+		if (site->dest_index < 0) continue;
+		GLuint dest = 0;
+		int dw = 0, dh = 0, type = 1;
+		if (site->kind == CF_SHADER_WRITE_KIND_IMAGE) {
+			if (site->dest_index >= dispatch.rw_texture_count) continue;
+			CF_GL_Texture* t = (CF_GL_Texture*)(uintptr_t)dispatch.rw_textures[site->dest_index].id;
+			if (!t) continue;
+			dest = t->id; dw = t->w; dh = t->h;
+			type = s_cs_dest_type(t->internal_fmt);
+		} else {
+			if (site->dest_index >= dispatch.rw_buffer_count) continue;
+			CF_GL_StorageBuffer* b = (CF_GL_StorageBuffer*)(uintptr_t)dispatch.rw_buffers[site->dest_index].id;
+			if (!b) continue;
+			dest = b->tex; dw = CF_GLES_STORAGE_WIDTH; dh = b->height;
+			type = 1;
+		}
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dest, 0);
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			static bool s_warned;
+			if (!s_warned) {
+				fprintf(stderr, "Compute write site %d: its destination cannot be rendered to on this GLES device (float targets need EXT_color_buffer_float); the write is dropped.\n", k);
+				s_warned = true;
+			}
+			continue;
+		}
+		glViewport(0, 0, dw, dh);
+		glUseProgram(s_cs.scatter[type]);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, s_cs.scratch[k].values);
+		glBindSampler(0, 0);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, s_cs.scratch[k].targets);
+		glBindSampler(1, 0);
+		glUniform1i(s_cs.scatter_loc_values[type], 0);
+		glUniform1i(s_cs.scatter_loc_targets[type], 1);
+		glUniform1i(s_cs.scatter_loc_grid_w[type], grid_w);
+		glUniform2i(s_cs.scatter_loc_dest_size[type], dw, dh);
+		int n = site->words == 1 || site->words == 2 ? site->words : 4;
+		for (int c = 0; c + n <= 4; c += n) {
+			glColorMask(c <= 0 && 0 < c + n, c <= 1 && 1 < c + n, c <= 2 && 2 < c + n, c <= 3 && 3 < c + n);
+			glUniform1i(s_cs.scatter_loc_component[type], c);
+			glDrawArrays(GL_POINTS, 0, T);
+		}
+	}
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glActiveTexture(GL_TEXTURE0);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, g_ctx.fbo);
+	CF_GL_Rect vp = g_ctx.current_state.viewport;
+	glViewport(vp.x, vp.y, vp.w, vp.h);
+	glColorMask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+	if (prev_blend) glEnable(GL_BLEND);
+	if (prev_depth) glEnable(GL_DEPTH_TEST);
+	if (prev_stencil) glEnable(GL_STENCIL_TEST);
+	if (prev_cull) glEnable(GL_CULL_FACE);
+	if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+	glBindVertexArray((GLuint)prev_vao);
+	glUseProgram((GLuint)prev_program);
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_draw_elements_indirect(CF_StorageBuffer args, int offset, int draw_count)
+{
+	// No indirect draw on GLES3.
+	CF_UNUSED(args);
+	CF_UNUSED(offset);
+	CF_UNUSED(draw_count);
+	CF_ASSERT(!"cf_draw_elements_indirect is not supported on the GLES3 backend.");
+}
+
+// Pending emulated storage bindings, applied by cf_gles_draw_elements_instanced.
+static CF_GL_StorageBuffer* s_vs_storage[4];
+static int s_vs_storage_count = 0;
+static CF_GL_StorageBuffer* s_fs_storage[4];
+static int s_fs_storage_count = 0;
+static_assert(CF_GLES_STORAGE_TEXTURE_RESERVE == CF_ARRAY_SIZE(s_vs_storage) + CF_ARRAY_SIZE(s_fs_storage),
+	"CF_GLES_STORAGE_TEXTURE_RESERVE must cover every unit s_apply_storage_textures can use");
+
+static void s_reset_storage_bindings()
+{
+	s_vs_storage_count = 0;
+	s_fs_storage_count = 0;
+}
+
+void cf_gles_apply_fs_storage_buffers(CF_StorageBuffer* buffers, int count)
+{
+	s_fs_storage_count = count > 4 ? 4 : count;
+	for (int i = 0; i < s_fs_storage_count; ++i) {
+		s_fs_storage[i] = (CF_GL_StorageBuffer*)(uintptr_t)buffers[i].id;
+	}
+}
+
+void cf_gles_apply_vs_storage_buffers(CF_StorageBuffer* buffers, int count)
+{
+	s_vs_storage_count = count > 4 ? 4 : count;
+	for (int i = 0; i < s_vs_storage_count; ++i) {
+		s_vs_storage[i] = (CF_GL_StorageBuffer*)(uintptr_t)buffers[i].id;
+	}
+}
+
+// Binds the pending emulated storage textures on the topmost texture units, counting down
+// from GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS - 1.
+static void s_apply_storage_textures()
+{
+	GLint program_i = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &program_i);
+	GLuint program = (GLuint)program_i;
+	if (!program) return;
+	static const char* vs_names[4] = { "u_vs_storage_0", "u_vs_storage_1", "u_vs_storage_2", "u_vs_storage_3" };
+	static const char* fs_names[4] = { "u_fs_storage_0", "u_fs_storage_1", "u_fs_storage_2", "u_fs_storage_3" };
+	CF_ASSERT(g_ctx.max_combined_texture_units >= CF_GLES_STORAGE_TEXTURE_RESERVE);
+	GLuint unit = (GLuint)(g_ctx.max_combined_texture_units - 1);
+	for (int i = 0; i < s_vs_storage_count; ++i) {
+		GLint loc = glGetUniformLocation(program, vs_names[i]);
+		if (loc < 0 || !s_vs_storage[i]) continue;
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glBindTexture(GL_TEXTURE_2D, s_vs_storage[i]->tex);
+		glBindSampler(unit, 0); // Stale sampler objects (e.g. compare mode) break texelFetch on some drivers.
+		glUniform1i(loc, unit);
+		--unit;
+	}
+	for (int i = 0; i < s_fs_storage_count; ++i) {
+		GLint loc = glGetUniformLocation(program, fs_names[i]);
+		if (loc < 0 || !s_fs_storage[i]) continue;
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glBindTexture(GL_TEXTURE_2D, s_fs_storage[i]->tex);
+		glBindSampler(unit, 0); // Stale sampler objects (e.g. compare mode) break texelFetch on some drivers.
+		glUniform1i(loc, unit);
+		--unit;
+	}
+	CF_POLL_OPENGL_ERROR();
+}
+
+void cf_gles_draw_elements_instanced(int instance_count)
+{
+	CF_GL_Mesh* mesh = g_ctx.mesh;
+	CF_MaterialInternal* material = g_ctx.material;
+	CF_ASSERT(mesh != NULL);
+	CF_ASSERT(material != NULL);
+	if (instance_count <= 0) return;
+
+	s_apply_state();
+	s_apply_storage_textures();
+
+	GLenum prim = s_wrap(material->state.primitive_type);
+	if (mesh->ibo.id && mesh->ibo.count > 0) {
+		GLenum elem = (mesh->ibo.stride == 2) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+		glDrawElementsInstanced(prim, mesh->ibo.count, elem, (const void*)(intptr_t)mesh->ibo.active_offset, instance_count);
+	} else if (mesh->vbo.count > 0) {
+		glDrawArraysInstanced(prim, 0, mesh->vbo.count, instance_count);
+	}
+	s_fence_draw_inputs(mesh, material);
+
+	CF_POLL_OPENGL_ERROR();
+	++app->draw_call_count;
+	g_ctx.target_state = s_default_state(g_ctx.canvas);
+}
+
+void cf_gles_push_gpu_label(const char* name)
+{
+	CF_UNUSED(name);
+}
+
+void cf_gles_pop_gpu_label()
+{
+}
+
+void cf_gles_current_canvas_size(int* w, int* h)
+{
+	if (g_ctx.canvas) {
+		*w = g_ctx.canvas->w;
+		*h = g_ctx.canvas->h;
+	} else {
+		*w = 0;
+		*h = 0;
+	}
+}
+
+bool cf_gles_current_canvas_has_depth()
+{
+	return s_canvas_has_depth(g_ctx.canvas);
+}
+
+// Synchronous readback: glReadPixels straight into a CPU buffer. CF renders canvases
+// with row 0 at the top (the window blit un-flips), so GL's bottom-up read order
+// already yields top-down rows -- no flip here.
+struct CF_GL_Readback
+{
+	void* data;
+	int size;
+};
+
+static int s_readback_channels(GLenum format)
+{
+	switch (format) {
+	case GL_RED: case GL_RED_INTEGER:   return 1;
+	case GL_RG: case GL_RG_INTEGER:     return 2;
+	case GL_RGB: case GL_RGB_INTEGER:   return 3;
+	case GL_RGBA: case GL_RGBA_INTEGER: return 4;
+	default: return 0;
+	}
+}
+
+// Bytes per texel of a target's own (format, type) layout; 0 for pairs the readback
+// does not handle (packed and compressed types).
+static int s_readback_texel_size(GLenum format, GLenum type)
+{
+	int channels = s_readback_channels(format);
+	if (!channels) return 0;
+	switch (type) {
+	case GL_UNSIGNED_BYTE: case GL_BYTE:                     return channels;
+	case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: return channels * 2;
+	case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT:          return channels * 4;
+	default: return 0;
+	}
+}
+
+// Exact for values read from a half-float target.
+static uint16_t s_half_from_float(float value)
+{
+	uint32_t x;
+	CF_MEMCPY(&x, &value, sizeof x);
+	uint32_t sign = (x >> 16) & 0x8000;
+	uint32_t mantissa = x & 0x7fffff;
+	int exponent = (int)((x >> 23) & 0xff);
+	if (exponent == 0xff) return (uint16_t)(sign | 0x7c00 | (mantissa ? 0x200 : 0));
+	exponent -= 127 - 15;
+	if (exponent >= 31) return (uint16_t)(sign | 0x7c00);
+	if (exponent <= 0) return (uint16_t)(exponent < -10 ? sign : sign | ((mantissa | 0x800000) >> (14 - exponent)));
+	return (uint16_t)(sign | ((uint32_t)exponent << 10) | (mantissa >> 13));
+}
+
+static bool s_only_guaranteed_read_pairs;
+
+void CF_CALL cf_gles_only_guaranteed_read_pairs(bool only)
+{
+	s_only_guaranteed_read_pairs = only;
+}
+
+// The type GLES guarantees with RGBA for reading a buffer of this class: UNSIGNED_BYTE for
+// normalized fixed-point, FLOAT for floating-point. GL_NONE where readback has no fallback.
+static GLenum s_guaranteed_read_type(GLenum format, GLenum type)
+{
+	if (format != GL_RED && format != GL_RG && format != GL_RGBA) return GL_NONE;
+	switch (type) {
+	case GL_UNSIGNED_BYTE: return GL_UNSIGNED_BYTE;
+	case GL_HALF_FLOAT: case GL_FLOAT: return GL_FLOAT;
+	default: return GL_NONE;
+	}
+}
+
+// Queries the bound read buffer, so call after glReadBuffer.
+static bool s_read_pair_supported(GLenum format, GLenum type)
+{
+	if (s_only_guaranteed_read_pairs) return false;
+	GLint impl_format = 0, impl_type = 0;
+	glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &impl_format);
+	glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &impl_type);
+	return (GLenum)impl_format == format && (GLenum)impl_type == type;
+}
+
+// Reads with the guaranteed RGBA pair and repacks into the target's own layout.
+static bool s_read_pixels_repacked(int w, int h, GLenum format, GLenum type, GLenum read_type, void* out)
+{
+	int channels = s_readback_channels(format);
+	int count = w * h;
+	void* rgba = CF_ALLOC(count * 4 * (read_type == GL_FLOAT ? 4 : 1));
+	glReadPixels(0, 0, w, h, GL_RGBA, read_type, rgba);
+	bool ok = glGetError() == GL_NO_ERROR;
+	if (ok) {
+		for (int i = 0; i < count; ++i) {
+			for (int c = 0; c < channels; ++c) {
+				int s = i * 4 + c, d = i * channels + c;
+				if (read_type == GL_UNSIGNED_BYTE) ((uint8_t*)out)[d] = ((uint8_t*)rgba)[s];
+				else if (type == GL_FLOAT) ((float*)out)[d] = ((float*)rgba)[s];
+				else ((uint16_t*)out)[d] = s_half_from_float(((float*)rgba)[s]);
+			}
+		}
+	}
+	CF_FREE(rgba);
+	return ok;
+}
+
+CF_Readback cf_gles_canvas_readback2(CF_Canvas canvas, int index)
+{
+	CF_GL_Canvas* c = (CF_GL_Canvas*)(uintptr_t)canvas.id;
+	if (!c || index < 0 || index >= (c->target_count > 1 ? c->target_count : 1)) return { 0 };
+	CF_GL_Texture* tex = (CF_GL_Texture*)(uintptr_t)(index == 0 ? c->cf_color.id : c->cf_colors_mrt[index].id);
+	if (!tex) return { 0 };
+	int w = c->w, h = c->h;
+
+	// The target's own layout, as the readback contract promises. BGRA targets read
+	// as RGBA: the bytes come back in RGBA order.
+	GLenum format = tex->upload_fmt == GL_BGRA ? GL_RGBA : tex->upload_fmt;
+	GLenum type = tex->upload_type;
+	int texel_size = s_readback_texel_size(format, type);
+	if (texel_size == 0) return { 0 };
+
+	GLuint prev_fbo = g_ctx.fbo;
+	s_bind_framebuffer(c->fbo);
+	// Only errors from the read sequence below are of interest, the read buffer
+	// selection included (a failed one silently reads target 0): drain whatever was
+	// pending first. Bounded, since a lost context reports itself on every call.
+	for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; ++i) { }
+	if (index != 0) glReadBuffer(GL_COLOR_ATTACHMENT0 + (GLenum)index);
+
+	// GLES only accepts a few (format, type) pairs per framebuffer: the guaranteed one
+	// of its buffer class -- RGBA/UNSIGNED_BYTE, RGBA/FLOAT, RGBA_INTEGER with
+	// (UNSIGNED_)INT -- plus one the implementation picks, usually the target's own
+	// layout. Anything else is an INVALID_OPERATION that leaves the buffer untouched.
+	CF_GL_Readback* rb = (CF_GL_Readback*)CF_ALLOC(sizeof(CF_GL_Readback));
+	rb->size = w * h * texel_size;
+	rb->data = CF_ALLOC(rb->size);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	GLenum guaranteed_type = s_guaranteed_read_type(format, type);
+	bool has_fallback = guaranteed_type != GL_NONE && !(format == GL_RGBA && type == guaranteed_type);
+	GLenum err = GL_INVALID_OPERATION;
+	if (!has_fallback || s_read_pair_supported(format, type)) {
+		glReadPixels(0, 0, w, h, format, type, rb->data);
+		err = glGetError();
+	}
+	if (err == GL_INVALID_OPERATION && has_fallback) {
+		err = s_read_pixels_repacked(w, h, format, type, guaranteed_type, rb->data) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+	}
+	if (err != GL_NO_ERROR) {
+		CF_FREE(rb->data);
+		CF_FREE(rb);
+		rb = NULL;
+	}
+
+	if (index != 0) glReadBuffer(GL_COLOR_ATTACHMENT0);
+	s_bind_framebuffer(prev_fbo);
+	CF_POLL_OPENGL_ERROR();
+	return { (uint64_t)(uintptr_t)rb };
+}
+
+CF_Readback cf_gles_canvas_readback(CF_Canvas canvas)
+{
+	return cf_gles_canvas_readback2(canvas, 0);
+}
+
+bool cf_gles_readback_ready(CF_Readback readback)
+{
+	return readback.id != 0;
+}
+
+int cf_gles_readback_data(CF_Readback readback, void* data, int size)
+{
+	CF_GL_Readback* rb = (CF_GL_Readback*)(uintptr_t)readback.id;
+	if (!rb) return 0;
+	int n = size < rb->size ? size : rb->size;
+	CF_MEMCPY(data, rb->data, n);
+	return n;
+}
+
+int cf_gles_readback_size(CF_Readback readback)
+{
+	CF_GL_Readback* rb = (CF_GL_Readback*)(uintptr_t)readback.id;
+	return rb ? rb->size : 0;
+}
+
+void cf_gles_destroy_readback(CF_Readback readback)
+{
+	CF_GL_Readback* rb = (CF_GL_Readback*)(uintptr_t)readback.id;
+	if (!rb) return;
+	CF_FREE(rb->data);
+	CF_FREE(rb);
+}
+
+void cf_gles_canvas_set_clear_color(CF_Canvas canvas_handle, CF_Color color)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	if (!canvas) return;
+	for (int i = 0; i < CF_MAX_CANVAS_TARGETS; ++i) {
+		canvas->has_clear_color[i] = true;
+		canvas->clear_color[i] = color;
+	}
+}
+
+void cf_gles_canvas_set_clear_color2(CF_Canvas canvas_handle, int index, CF_Color color)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	if (!canvas || index < 0 || index >= CF_MAX_CANVAS_TARGETS) return;
+	canvas->has_clear_color[index] = true;
+	canvas->clear_color[index] = color;
+}
+
+void cf_gles_canvas_set_clear_depth_stencil(CF_Canvas canvas_handle, float depth, uint32_t stencil)
+{
+	CF_GL_Canvas* canvas = (CF_GL_Canvas*)(uintptr_t)canvas_handle.id;
+	if (!canvas) return;
+	canvas->has_clear_depth_stencil = true;
+	canvas->clear_depth = depth;
+	canvas->clear_stencil = stencil;
+}

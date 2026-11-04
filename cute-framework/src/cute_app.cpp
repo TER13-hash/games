@@ -1,0 +1,1016 @@
+/*
+	Cute Framework
+	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
+
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
+*/
+
+#include <cute_app.h>
+#include <cute_alloc.h>
+#include <cute_audio.h>
+#include <cute_multithreading.h>
+#include <cute_file_system.h>
+#include <cute_c_runtime.h>
+#include <cute_draw.h>
+#include <cute_time.h>
+
+#include <internal/cute_alloc_internal.h>
+#include <internal/cute_app_internal.h>
+#include <internal/cute_input_internal.h>
+#include <internal/cute_graphics_internal.h>
+#include <internal/cute_draw_internal.h>
+#include <internal/cute_custom_sprite_internal.h>
+#include <internal/cute_aseprite_cache_internal.h>
+#include <internal/cute_imgui_internal.h>
+#include <internal/cute_binding_internal.h>
+#include <internal/cute_crash_internal.h>
+
+#include <scottt/debugbreak.h>
+
+#include <data/fonts/calibri.h>
+
+#include <SDL3/SDL.h>
+
+#define CUTE_SOUND_FORCE_SDL
+#include <cute/cute_sound.h>
+
+CF_STATIC_ASSERT(sizeof(uint64_t) >= sizeof(void*), "Must be equal for opaque id implementations throughout CF.");
+
+// cf_destroy_app quits SDL, so a flag cached across apps would go stale.
+static void s_init_video()
+{
+	if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+}
+
+CF_DisplayID cf_default_display()
+{
+	s_init_video();
+	return SDL_GetPrimaryDisplay();
+}
+
+int cf_display_count()
+{
+	s_init_video();
+	int count = 0;
+	SDL_DisplayID* ids = SDL_GetDisplays(&count);
+	SDL_free(ids);
+	return count;
+}
+
+CF_DisplayID* cf_get_display_list()
+{
+	s_init_video();
+	int count = 0;
+	SDL_DisplayID* ids = SDL_GetDisplays(&count);
+	return (CF_DisplayID*)ids;
+}
+
+void cf_free_display_list(CF_DisplayID* display_list)
+{
+	SDL_free(display_list);
+}
+
+int cf_display_x(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_Rect rect = { 0 };
+	SDL_GetDisplayBounds(display_id, &rect);
+	return rect.x;
+}
+
+int cf_display_y(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_Rect rect = { 0 };
+	SDL_GetDisplayBounds(display_id, &rect);
+	return rect.y;
+}
+
+int cf_display_width(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_Rect rect = { 0 };
+	SDL_GetDisplayBounds(display_id, &rect);
+	return rect.w;
+}
+
+int cf_display_height(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_Rect rect = { 0 };
+	SDL_GetDisplayBounds(display_id, &rect);
+	return rect.h;
+}
+
+float cf_display_refresh_rate(CF_DisplayID display_id)
+{
+	s_init_video();
+	const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
+	return mode ? mode->refresh_rate : 0;
+}
+
+CF_Rect cf_display_bounds(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_Rect rect = { 0 };
+	SDL_GetDisplayBounds(display_id, &rect);
+	CF_Rect result = { rect.x, rect.y, rect.w, rect.h };
+	return result;
+}
+
+const char* cf_display_name(CF_DisplayID display_id)
+{
+	s_init_video();
+	return SDL_GetDisplayName(display_id);
+}
+
+CF_DisplayOrientation cf_display_orientation(CF_DisplayID display_id)
+{
+	s_init_video();
+	SDL_DisplayOrientation orientation = SDL_GetCurrentDisplayOrientation(display_id);
+	switch (orientation) {
+	default:
+	case SDL_ORIENTATION_UNKNOWN: return CF_DISPLAY_ORIENTATION_UNKNOWN;
+	case SDL_ORIENTATION_LANDSCAPE: return CF_DISPLAY_ORIENTATION_LANDSCAPE;
+	case SDL_ORIENTATION_LANDSCAPE_FLIPPED: return CF_DISPLAY_ORIENTATION_LANDSCAPE_FLIPPED;
+	case SDL_ORIENTATION_PORTRAIT: return CF_DISPLAY_ORIENTATION_PORTRAIT;
+	case SDL_ORIENTATION_PORTRAIT_FLIPPED: return CF_DISPLAY_ORIENTATION_PORTRAIT_FLIPPED;
+	}
+}
+
+CF_API CF_App* app;
+
+using namespace Cute;
+
+// Embedded white_pixel
+
+static void s_canvas(int w, int h)
+{
+	CF_CanvasParams params = cf_canvas_defaults(w, h);
+	params.target.filter = CF_FILTER_LINEAR;
+	if (app->offscreen_canvas.id) {
+		cf_destroy_canvas(app->offscreen_canvas);
+	}
+	params.depth_stencil_enable = true;
+	params.sample_count = (CF_SampleCount)cf_clamp((app->sample_count >> 1), 0, 3);
+	app->offscreen_canvas = cf_make_canvas(params);
+	app->canvas_w = w;
+	app->canvas_h = h;
+}
+
+void cf_app_recreate_default_canvas_if_needed()
+{
+	int w = (int)CF_ROUNDF(app->w * app->pixel_scale);
+	int h = (int)CF_ROUNDF(app->h * app->pixel_scale);
+	// A canvas cannot be zero-sized. Keep the current one until the window has area again.
+	if (w <= 0 || h <= 0) return;
+	s_canvas(w, h);
+	cf_draw_on_app_canvas_resized(app->w, app->h); // The draw API stays in window points.
+}
+
+CF_Result cf_make_app(const char* window_title, CF_DisplayID display_id, int x, int y, int w, int h, CF_AppOptionFlags options, const char* argv0)
+{
+	// A second app would silently clobber the global app state, and the first thing to
+	// actually fail is the file system init deep inside this function (PHYSFS refuses to
+	// double-init) -- fail loudly and recoverably up front instead.
+	if (app) {
+		return cf_result_error("cf_make_app called while an app already exists -- call cf_destroy_app first.");
+	}
+
+	// Route Box2D's allocations and asserts through CF (see cute_physics.h). Box2D says
+	// to set these during application startup, before any world exists.
+	extern void cf_physics_wire_allocator();
+	cf_physics_wire_allocator();
+
+	bool use_dx11 = options & CF_APP_OPTIONS_GFX_D3D11_BIT;
+	bool use_dx12 = options & CF_APP_OPTIONS_GFX_D3D12_BIT;
+	bool use_metal = options & CF_APP_OPTIONS_GFX_METAL_BIT;
+	bool use_vulkan = options & CF_APP_OPTIONS_GFX_VULKAN_BIT;
+	bool use_opengl = options & CF_APP_OPTIONS_GFX_OPENGL_BIT;
+	bool use_webgpu = options & CF_APP_OPTIONS_GFX_WEBGPU_BIT;
+	bool use_gfx = !(options & CF_APP_OPTIONS_NO_GFX_BIT);
+
+#if !defined(CF_WEBGPU) && !defined(CF_EMSCRIPTEN)
+	if (use_webgpu) {
+		return cf_result_error("CF_APP_OPTIONS_GFX_WEBGPU_BIT needs CF built with the CF_WEBGPU CMake option.");
+	}
+#endif
+
+#ifdef CF_EMSCRIPTEN
+	// WebGPU when the build carries it and the browser offers an adapter (probed below, before
+	// the window exists), otherwise WebGL 2. CF_APP_OPTIONS_GFX_WEBGPU_BIT has no say here.
+#	ifdef CF_WEBGPU
+	use_webgpu = !use_opengl;
+#	else
+	use_webgpu = false;
+#	endif
+	if (!use_webgpu) use_opengl = true;
+#elif defined(CF_ANDROID)
+	// On Android, default to Vulkan via SDL_GPU. GLES3 fallback is handled below.
+	if (!use_vulkan && !use_opengl) {
+		use_vulkan = true;
+	}
+#else
+	if (use_opengl) {
+		fprintf(stderr, "WARNING -- OpenGL ES is not intended for non-web builds! Use at your own risk (i.e. for developement or debugging).\n");
+	}
+#endif
+
+	// Ensure the user selected only one backend, if they selected one at all.
+	if (use_dx11) {
+		CF_ASSERT(!use_dx12);
+		CF_ASSERT(!use_metal);
+		CF_ASSERT(!use_vulkan);
+		CF_ASSERT(!use_opengl);
+	}
+	if (use_dx12) {
+		CF_ASSERT(!use_dx11);
+		CF_ASSERT(!use_metal);
+		CF_ASSERT(!use_vulkan);
+		CF_ASSERT(!use_opengl);
+	}
+	if (use_metal) {
+		CF_ASSERT(!use_dx11);
+		CF_ASSERT(!use_dx12);
+		CF_ASSERT(!use_vulkan);
+		CF_ASSERT(!use_opengl);
+	}
+	if (use_vulkan) {
+		CF_ASSERT(!use_dx11);
+		CF_ASSERT(!use_dx12);
+		CF_ASSERT(!use_metal);
+		CF_ASSERT(!use_opengl);
+	}
+	if (use_opengl) {
+		CF_ASSERT(!use_dx11);
+		CF_ASSERT(!use_dx12);
+		CF_ASSERT(!use_metal);
+		CF_ASSERT(!use_vulkan);
+		CF_ASSERT(!use_webgpu);
+	}
+	if (use_webgpu) {
+		CF_ASSERT(!use_dx11);
+		CF_ASSERT(!use_dx12);
+		CF_ASSERT(!use_metal);
+		CF_ASSERT(!use_vulkan);
+	}
+
+	Uint32 sdl_options = SDL_INIT_EVENTS | SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC;
+	if (options & CF_APP_OPTIONS_NO_GFX_BIT) {
+		sdl_options &= ~SDL_INIT_VIDEO;
+	}
+	if (!(options & CF_APP_OPTIONS_NO_AUDIO_BIT)) {
+		SDL_Init(SDL_INIT_AUDIO);
+	}
+
+	if (!SDL_Init(sdl_options)) {
+		SDL_Quit(); // Shut down any subsystems that did initialize (e.g. audio).
+		return cf_result_error("SDL_Init failed");
+	}
+
+	CF_BackendType gfx_backend_type = CF_BACKEND_TYPE_INVALID;
+	if (use_gfx) {
+		// Some backends don't support window size of zero.
+		w = w <= 0 ? 1 : w;
+		h = h <= 0 ? 1 : h;
+
+		CF_Result init_gfx_result = {  };
+		bool debug = options & CF_APP_OPTIONS_GFX_DEBUG_BIT;
+
+#ifdef CF_WEBGPU
+		if (use_webgpu) {
+			init_gfx_result = cf_webgpu_init(debug);
+			if (!cf_is_error(init_gfx_result)) {
+				gfx_backend_type = CF_BACKEND_TYPE_WEBGPU;
+			} else {
+#	ifdef CF_EMSCRIPTEN
+				// No adapter, device, or canvas context: the browser lacks WebGPU or blocks it, so
+				// WebGL 2 it is. The canvas is still free, since getContext("webgpu") failed.
+				printf("%s (falling back to WebGL 2)\n", init_gfx_result.details);
+				use_webgpu = false;
+				use_opengl = true;
+#	endif
+			}
+		}
+#endif
+
+		// Create the SDL GPU device.
+		if (!use_webgpu && !use_opengl) {
+#ifndef CF_EMSCRIPTEN
+			const char* device_name = NULL;
+			if (use_dx11) {
+				device_name = "direct3d11";
+			} else if (use_dx12) {
+				device_name = "direct3d12";
+			} else if (use_metal) {
+				device_name = "metal";
+			} else if (use_vulkan) {
+				device_name = "vulkan";
+			}
+
+			init_gfx_result = cf_sdlgpu_init(device_name, debug, &gfx_backend_type);
+#	ifdef CF_ANDROID
+			// On Android, fall back to GLES3 if Vulkan/SDL_GPU fails.
+			if (cf_is_error(init_gfx_result)) {
+				init_gfx_result = cf_gles_init(debug);
+				if (!cf_is_error(init_gfx_result)) {
+					gfx_backend_type = CF_BACKEND_TYPE_GLES3;
+					use_opengl = true;
+				}
+			}
+#	endif
+#endif
+		} else if (use_opengl) {
+			init_gfx_result = cf_gles_init(debug);
+			gfx_backend_type = CF_BACKEND_TYPE_GLES3;
+		}
+
+		if (cf_is_error(init_gfx_result)) {
+			gfx_backend_type = CF_BACKEND_TYPE_INVALID;
+			SDL_Quit();
+			return init_gfx_result;
+		}
+	}
+
+	SDL_Window* window = NULL;
+	if (use_gfx) {
+		Uint32 flags = 0;
+		if (!(options & CF_APP_OPTIONS_NO_HIGH_DPI_BIT)) {
+			flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY; // Turn on high DPI support for all platforms, unless explicitly disabled.
+		}
+		if (use_opengl) flags |= SDL_WINDOW_OPENGL;
+		if (use_metal) flags |= SDL_WINDOW_METAL;
+#if defined(CF_WEBGPU) && defined(__APPLE__)
+		if (use_webgpu) flags |= SDL_WINDOW_METAL;
+#endif
+		if (options & CF_APP_OPTIONS_FULLSCREEN_BIT) flags |= SDL_WINDOW_FULLSCREEN;
+		if (options & CF_APP_OPTIONS_RESIZABLE_BIT) flags |= SDL_WINDOW_RESIZABLE;
+		if (options & CF_APP_OPTIONS_HIDDEN_BIT) flags |= (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED);
+
+		SDL_PropertiesID props = SDL_CreateProperties();
+		SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, window_title);
+		SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+		SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+		SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags);
+		if (options & CF_APP_OPTIONS_WINDOW_POS_CENTERED_BIT) {
+			SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display_id));
+			SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display_id));
+		} else {
+			if (display_id == 0) display_id = SDL_GetPrimaryDisplay();
+			int x_offset = display_x(display_id);
+			int y_offset = display_y(display_id);
+			SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, x_offset+x);
+			SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y_offset+y);
+		}
+		window = SDL_CreateWindowWithProperties(props);
+		SDL_DestroyProperties(props);
+		if (!window) {
+#ifdef CF_WEBGPU
+			if (use_webgpu) cf_webgpu_cleanup();
+#endif
+#ifndef CF_EMSCRIPTEN
+			if (!use_opengl && !use_webgpu) cf_sdlgpu_cleanup();
+#endif
+			SDL_Quit();
+			return cf_result_error("Failed to create the application window.");
+		}
+	}
+
+	CF_App* app = (CF_App*)CF_ALLOC(sizeof(CF_App));
+	CF_PLACEMENT_NEW(app) CF_App;
+	app->options = options;
+	app->gfx_backend_type = gfx_backend_type;
+	app->window = window;
+	app->w = w;
+	app->h = h;
+	if (window) {
+		// The backend may have adopted a different size than requested (a CSS-sized canvas
+		// on Emscripten, a window manager clamping to the display) without sending a resize
+		// event, so read the created size back rather than trusting the requested one.
+		SDL_GetWindowSize(app->window, &app->w, &app->h);
+		SDL_GetWindowPosition(app->window, &app->x, &app->y);
+		app->display_scale = SDL_GetWindowDisplayScale(app->window);
+		app->pixel_scale = window ? SDL_GetWindowPixelDensity(app->window) : 1.0f;
+		// A window without area has no density: SDL divides 0 by 0, and NaN fails every comparison.
+		if (!(app->pixel_scale > 0.0f)) app->pixel_scale = 1.0f;
+		if (options & CF_APP_OPTIONS_NO_HIGH_DPI_BIT) app->pixel_scale = 1.0f;
+	}
+	::app = app;
+
+	// Queue a dummy event.
+	// Under the main callback path, after `SDL_AppInit` has returned, this will
+	// trigger `SDL_AppEvent` and switch CF off the polling path.
+	// Usually, window creation will push a "window shown" event and achieve the same effect.
+	// However, this is not the case if the app was created with CF_APP_OPTIONS_HIDDEN_BIT.
+	// Pushing an event during startup guarantees that the correct path is chosen.
+	// In both cases, this event is ignored.
+	SDL_Event probe = { .type = SDL_RegisterEvents(1) };
+	SDL_PushEvent(&probe);
+
+	cf_make_aseprite_cache();
+	cf_make_custom_sprite_cache();
+
+	if (use_gfx) {
+		if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+			cf_gles_attach(app->window);
+#ifdef CF_WEBGPU
+		} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+			cf_webgpu_attach(app->window);
+#endif
+		} else {
+#ifndef CF_EMSCRIPTEN
+			cf_sdlgpu_attach(app->window);
+#endif
+		}
+
+		cf_load_internal_shaders();
+		cf_make_draw();
+
+		cf_app_recreate_default_canvas_if_needed();
+
+		// Create the default font.
+		make_font_from_memory(calibri_data, calibri_sz, "Calibri");
+
+		// Ensure initial resources are uploaded
+		if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+			cf_gles_flush();
+#ifdef CF_WEBGPU
+		} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+			cf_webgpu_flush();
+#endif
+		} else {
+#ifndef CF_EMSCRIPTEN
+			cf_sdlgpu_flush();
+#endif
+		}
+	}
+
+#ifdef CF_WINDOWS
+	if (window) {
+		app->platform_handle = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+	}
+#endif
+
+	app->gfx_enabled = use_gfx;
+
+	if (!(options & CF_APP_OPTIONS_NO_AUDIO_BIT)) {
+		cs_error_t err = cs_init(44100, NULL);
+		if (err == CUTE_SOUND_ERROR_NONE) {
+			app->audio_needs_updates = true;
+		}
+		// If audio init fails, continue silently without audio.
+	}
+
+	CF_Result err = cf_fs_init(argv0);
+	if (cf_is_error(err)) {
+		// Most commonly PHYSFS_ERR_IS_INITIALIZED: someone called cf_fs_init (or leaked a
+		// previous app's file system) before cf_make_app. Print the reason -- a bare assert
+		// here has historically been a miserable thing to root-cause.
+		fprintf(stderr, "cf_fs_init failed in cf_make_app: %s\n", err.details ? err.details : "unknown error");
+		CF_ASSERT(0);
+	} else if (!(options & CF_APP_OPTIONS_FILE_SYSTEM_DONT_DEFAULT_MOUNT_BIT)) {
+		// Put the base directory (the path to the exe) onto the file system search path.
+		cf_fs_mount(cf_fs_get_base_directory(), "", true);
+	}
+
+	cf_crash_app_made_internal();
+	return cf_result_success();
+}
+
+void cf_destroy_app()
+{
+	if (!app) return;
+	if (app->using_imgui) {
+		cf_imgui_shutdown();
+		app->using_imgui = false;
+	}
+	if (app->gfx_enabled) {
+		cf_destroy_canvas(app->offscreen_canvas);
+		cf_destroy_draw();
+		cf_unload_internal_shaders();
+
+		if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+			cf_gles_cleanup();
+#ifdef CF_WEBGPU
+		} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+			cf_webgpu_cleanup();
+#endif
+		} else {
+#ifndef CF_EMSCRIPTEN
+			cf_sdlgpu_cleanup();
+#endif
+		}
+	}
+	cf_destroy_all_fonts();
+	cf_destroy_aseprite_cache();
+	cf_destroy_custom_sprite_cache();
+	cs_shutdown();
+	destroy_mutex(&app->on_sound_finish_mutex);
+	if (app->window) SDL_DestroyWindow(app->window);
+	SDL_Quit();
+	CF_Image* easy_sprites = app->easy_sprites.items();
+	for (int i = 0; i < app->easy_sprites.count(); ++i) {
+		cf_image_free(&easy_sprites[i]);
+	}
+	app->~CF_App();
+	CF_FREE(app);
+	app = NULL;
+	cf_fs_destroy();
+}
+
+bool cf_app_is_running()
+{
+	return app->running;
+}
+
+void cf_app_signal_shutdown()
+{
+	app->running = 0;
+}
+
+static void s_on_update(void* udata)
+{
+	cf_pump_input_msgs();
+	cf_binding_update();
+	if (app->audio_needs_updates) {
+		cs_update(CF_DELTA_TIME);
+		if (app->on_sound_finish_single_threaded) {
+			mutex_lock(&app->on_sound_finish_mutex);
+			Array<CF_Sound> on_finish = cf_move(app->on_sound_finish_queue);
+			bool music_finished = app->on_music_finish_signal;
+			app->on_music_finish_signal = false;
+			mutex_unlock(&app->on_sound_finish_mutex);
+			for (int i = 0; i < on_finish.size(); ++i) {
+				app->on_sound_finish(on_finish[i], app->on_sound_finish_udata);
+			}
+			if (app->on_music_finish && music_finished) {
+				app->on_music_finish(app->on_music_finish_udata);
+			}
+		}
+	}
+	if (app->user_on_update) app->user_on_update(udata);
+}
+
+void cf_app_update(CF_OnUpdateFn* on_update)
+{
+	cf_crash_app_update_internal();
+	if (s_draw) s_draw->defragged_this_frame = false; // New frame: the defrag latch re-arms.
+	if (app->gfx_enabled) {
+		if (app->using_imgui) {
+			if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+				ImGui_ImplOpenGL3_NewFrame();
+#ifdef CF_WEBGPU
+			} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+				cf_webgpu_imgui_new_frame();
+#endif
+			} else {
+				ImGui_ImplSDLGPU3_NewFrame();
+			}
+			ImGui_ImplSDL3_NewFrame();
+			ImGui::NewFrame();
+		}
+
+		if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+			cf_gles_begin_frame();
+#ifdef CF_WEBGPU
+		} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+			cf_webgpu_begin_frame();
+#endif
+		} else {
+#ifndef CF_EMSCRIPTEN
+			cf_sdlgpu_begin_frame();
+#endif
+		}
+		cf_shader_watch();
+	}
+	app->user_on_update = on_update;
+	cf_begin_frame_input();
+	cf_update_time(s_on_update);
+}
+
+int cf_app_draw_onto_screen(bool clear)
+{
+	if (app->sync_window) {
+		app->sync_window = false;
+		SDL_SyncWindow(app->window);
+	}
+
+	// Update lifetime of all text effects.
+	uint64_t* effect_keys = app->text_effect_states.keys();
+	CF_TextEffectState* effect_states = app->text_effect_states.items();
+	int count = app->text_effect_states.count();
+	for (int i = 0; i < count;) {
+		if (!effect_states[i].alive) {
+			app->text_effect_states.remove(effect_keys[i]);
+			--count;
+		} else {
+			effect_states[i].alive = false;
+			++i;
+		}
+	}
+
+	// Do the same for text states.
+	uint64_t* text_keys = app->parsed_text_states.keys();
+	CF_ParsedTextState* text_states = app->parsed_text_states.items();
+	count = app->parsed_text_states.count();
+	for (int i = 0; i < count;) {
+		if (!text_states[i].alive) {
+			app->parsed_text_states.remove(text_keys[i]);
+			--count;
+		} else {
+			text_states[i].alive = false;
+			++i;
+		}
+	}
+
+	// Update the atlas_cache itself.
+	// This does atlas management internally.
+	// All references to backend texture id's are now invalid (fetch_image or cf_texture_handle).
+	if (!s_draw->delay_defrag) {
+		atlas_cache_tick(&s_draw->atlas_cache);
+		// The authoritative once-per-frame defrag, placed before the final render below so
+		// everything packs ahead of it. Flush sites earlier in the frame use the same latch
+		// (cf_atlas_defrag_once), so a frame sees at most this defrag plus one mid-frame one.
+		atlas_cache_defrag(&s_draw->atlas_cache);
+		s_draw->defragged_this_frame = true;
+	}
+
+	// Render any remaining geometry in the draw API.
+	cf_render_to(app->offscreen_canvas, clear);
+
+	// Draw the app canvas
+	if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+		cf_gles_blit_canvas(app->offscreen_canvas);
+#ifdef CF_WEBGPU
+	} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+		cf_webgpu_blit_canvas(app->offscreen_canvas);
+#endif
+	} else {
+#ifndef CF_EMSCRIPTEN
+		cf_sdlgpu_blit_canvas(app->offscreen_canvas);
+#endif
+	}
+
+	// Dear ImGui draw.
+	if (app->using_imgui) {
+		ImGui::EndFrame();
+		ImGui::Render();
+		cf_imgui_draw();
+	}
+
+	// Do defrag down here after rendering ImGui to avoid thrashing any texture IDs. Generally we want to defrag
+	// before doing final rendering to reduce draw call count, but in the case where ImGui is rendered it's acceptable
+	// to have the perf-hit and delay until next frame.
+	if (s_draw->delay_defrag) {
+		atlas_cache_tick(&s_draw->atlas_cache);
+		atlas_cache_defrag(&s_draw->atlas_cache);
+		s_draw->delay_defrag = false;
+	}
+
+	if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+		cf_gles_end_frame();
+#ifdef CF_WEBGPU
+	} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+		cf_webgpu_end_frame();
+#endif
+	} else {
+#ifndef CF_EMSCRIPTEN
+		cf_sdlgpu_end_frame();
+#endif
+	}
+
+	// Clear all pushed draw parameters.
+	s_draw->alpha_discards.set_count(1);
+	s_draw->colors.set_count(1);
+	s_draw->antialias.set_count(1);
+	s_draw->render_states.set_count(1);
+	s_draw->scissors.set_count(1);
+	s_draw->viewports.set_count(1);
+	s_draw->layers.set_count(1);
+	s_draw->zs.set_count(1);
+	s_draw->reset_cam();
+	s_draw->font_sizes.set_count(1);
+	s_draw->fonts.set_count(1);
+	s_draw->blurs.set_count(1);
+	s_draw->text_wrap_widths.set_count(1);
+	s_draw->vertical.set_count(1);
+	s_draw->text_ids.set_count(1);
+	s_draw->user_params.set_count(1);
+	s_draw->shaders.set_count(1);
+	s_draw->clear_layers();
+	s_draw->prune_idle_layers();
+	cf_arena_reset(&s_draw->uniform_arena);
+	s_draw->switch_layer(s_draw->layers.last());
+
+	// Report the number of draw calls.
+	int draw_call_count = app->draw_call_count;
+	app->draw_call_count = 0;
+	return draw_call_count;
+}
+
+void cf_app_get_size(int* w, int* h)
+{
+	if (w) *w = app->w;
+	if (h) *h = app->h;
+}
+
+int cf_app_get_width()
+{
+	return app->w;
+}
+
+int cf_app_get_height()
+{
+	return app->h;
+}
+
+void cf_app_show_window()
+{
+	SDL_ShowWindow(app->window);
+}
+
+float cf_app_get_display_scale()
+{
+	return app->display_scale;
+}
+
+bool cf_app_display_scale_was_changed()
+{
+	return app->display_scale_was_changed;
+}
+
+float cf_app_get_pixel_scale()
+{
+	return app->pixel_scale;
+}
+
+void cf_app_set_size(int w, int h)
+{
+	SDL_SetWindowSize(app->window, w, h);
+	app->w = w;
+	app->h = h;
+	app->sync_window = true;
+	// Recreate the app canvas now rather than waiting for the resize event: hidden windows
+	// don't reliably deliver one, and a caller who set the size expects the canvas (and the
+	// default 2d projection that tracks it) to match immediately.
+	cf_app_recreate_default_canvas_if_needed();
+}
+
+void cf_app_get_position(int* x, int* y)
+{
+	if (x) *x = app->x;
+	if (y) *y = app->y;
+}
+
+void cf_app_set_position(int x, int y)
+{
+	SDL_SetWindowPosition(app->window, x, y);
+	app->sync_window = true;
+}
+
+void cf_app_center_window()
+{
+	SDL_SetWindowPosition(app->window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	app->sync_window = true;
+}
+
+bool cf_app_was_resized()
+{
+	return app->window_state.resized;
+}
+
+bool cf_app_was_moved()
+{
+	return app->window_state.moved;
+}
+
+bool cf_app_lost_focus()
+{
+	return !app->window_state.has_keyboard_focus && app->window_state_prev.has_keyboard_focus;
+}
+
+bool cf_app_gained_focus()
+{
+	return app->window_state.has_keyboard_focus && !app->window_state_prev.has_keyboard_focus;
+}
+
+bool cf_app_has_focus()
+{
+	return app->window_state.has_keyboard_focus;
+}
+
+void cf_app_request_attention()
+{
+	SDL_FlashWindow(app->window, SDL_FLASH_BRIEFLY);
+}
+
+void cf_app_request_attention_continuously()
+{
+	SDL_FlashWindow(app->window, SDL_FLASH_UNTIL_FOCUSED);
+}
+
+void cf_app_request_attention_cancel()
+{
+	SDL_FlashWindow(app->window, SDL_FLASH_CANCEL);
+}
+
+bool cf_app_was_minimized()
+{
+	return app->window_state.minimized && !app->window_state_prev.minimized;
+}
+
+bool cf_app_was_maximized()
+{
+	return app->window_state.maximized && !app->window_state_prev.maximized;
+}
+
+bool cf_app_minimized()
+{
+	return app->window_state.minimized;
+}
+
+bool cf_app_maximized()
+{
+	return app->window_state.maximized;
+}
+
+bool cf_app_was_restored()
+{
+	return app->window_state.restored && !app->window_state_prev.restored;
+}
+
+bool cf_app_mouse_entered()
+{
+	return app->window_state.mouse_inside_window && !app->window_state_prev.mouse_inside_window;
+}
+
+bool cf_app_mouse_exited()
+{
+	return !app->window_state.mouse_inside_window && app->window_state_prev.mouse_inside_window;
+}
+
+bool cf_app_mouse_inside()
+{
+	return app->window_state.mouse_inside_window;
+}
+
+bool cf_app_set_msaa(int sample_count)
+{
+	bool supported = false;
+	if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+		supported = cf_gles_supports_msaa(sample_count);
+#ifdef CF_WEBGPU
+	} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+		supported = cf_webgpu_supports_msaa(sample_count);
+#endif
+	} else {
+#ifndef CF_EMSCRIPTEN
+		supported = cf_sdlgpu_supports_msaa(sample_count);
+#endif
+	}
+
+	if (supported && app->sample_count != sample_count) {
+		app->sample_count = sample_count;
+		cf_app_recreate_default_canvas_if_needed();
+	}
+
+	return supported;
+}
+
+CF_Canvas cf_app_get_canvas()
+{
+	return app->offscreen_canvas;
+}
+
+void cf_app_set_canvas_size(int w, int h)
+{
+	s_canvas(w, h);
+	cf_draw_on_app_canvas_resized(w, h); // An explicit canvas size is drawn in its own pixels (a 320x180 retro target).
+}
+
+int cf_app_get_canvas_width()
+{
+	return app->canvas_w;
+}
+
+int cf_app_get_canvas_height()
+{
+	return app->canvas_h;
+}
+
+void cf_app_set_canvas_blit_filter(CF_Filter filter)
+{
+	app->canvas_blit_filter = filter;
+}
+
+bool cf_app_set_present_mode(CF_PresentMode mode)
+{
+	bool applied;
+	if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
+		applied = cf_gles_set_present_mode(mode);
+#ifdef CF_WEBGPU
+	} else if (app->gfx_backend_type == CF_BACKEND_TYPE_WEBGPU) {
+		applied = cf_webgpu_set_present_mode(mode);
+#endif
+	} else {
+#ifndef CF_EMSCRIPTEN
+		applied = cf_sdlgpu_set_present_mode(mode);
+#else
+		applied = false;
+#endif
+	}
+	if (applied) {
+		app->present_mode = mode;
+	}
+	return applied;
+}
+
+CF_PresentMode cf_app_get_present_mode()
+{
+	return app->present_mode;
+}
+
+void cf_app_set_windowed_mode()
+{
+	SDL_SetWindowFullscreen(app->window, 0);
+}
+
+void cf_app_set_borderless_fullscreen_mode()
+{
+	SDL_SetWindowFullscreen(app->window, true);
+}
+
+void cf_app_set_fullscreen_mode()
+{
+	SDL_SetWindowFullscreen(app->window, SDL_WINDOW_FULLSCREEN);
+}
+
+void cf_app_set_title(const char* title)
+{
+	SDL_SetWindowTitle(app->window, title);
+}
+
+// Here for easy porting from SDL2.
+SDL_Surface *SDL_CreateRGBSurfaceFrom(void *pixels, int width, int height, int depth, int pitch, Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask)
+{
+	return SDL_CreateSurfaceFrom(width, height, SDL_GetPixelFormatForMasks(depth, Rmask, Gmask, Bmask, Amask), pixels, pitch);
+}
+
+void cf_app_set_icon(const char* virtual_path_to_png)
+{
+	CF_Image img;
+	if (is_error(cf_image_load_png(virtual_path_to_png, &img))) {
+		fprintf(stderr, "Unable to open icon png file %s.", virtual_path_to_png);
+		return;
+	}
+	SDL_Surface* icon = SDL_CreateRGBSurfaceFrom(img.pix, img.w, img.h, 32, img.w * 4, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+	SDL_SetWindowIcon(app->window, icon);
+	SDL_DestroySurface(icon);
+	cf_image_free(&img);
+}
+
+float cf_app_get_framerate()
+{
+	return 1.0f / CF_DELTA_TIME;
+}
+
+SDL_Window* CF_CALL cf_app_get_window(void)
+{
+	return app->window;
+}
+
+void* cf_app_init_imgui()
+{
+	if (!app->gfx_enabled) return NULL;
+
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	app->using_imgui = true;
+
+	cf_imgui_init();
+
+	return (void*)::ImGui::GetCurrentContext();
+}
+
+CF_PowerInfo cf_app_power_info()
+{
+	CF_PowerInfo info;
+	SDL_PowerState state = SDL_GetPowerInfo(&info.seconds_left, &info.percentage_left);
+	info.state = cf_power_state_from_sdl(state);
+	return info;
+}
+
+void cf_default_assert(bool expr, const char* message, const char* file, int line)
+{
+	if (!expr) {
+		fprintf(stderr, "CF_ASSERT(%s) : %s, line %d\n", message, file, line);
+		debug_break();
+	}
+}
+
+cf_assert_fn* g_assert_fn = cf_default_assert;
+
+void cf_set_assert_handler(cf_assert_fn* assert_fn)
+{
+	g_assert_fn = assert_fn;
+}
