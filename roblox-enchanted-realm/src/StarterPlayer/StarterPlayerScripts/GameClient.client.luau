@@ -1252,7 +1252,7 @@ local function setupCharacter(char: Model)
 	hum.AutoRotate = true
 	-- we drive jumping ourselves (double jump / wind bonus) — disable the default
 	hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
-	hrp.CFrame = CFrame.new(30, 4, 0)
+	hrp.CFrame = CFrame.lookAt(Vector3.new(30, 4, 0), Vector3.new(200, 4, 0))
 
 	-- full 3D: default Roblox third-person camera (mouse orbit / wheel zoom)
 	camera.CameraType = Enum.CameraType.Custom

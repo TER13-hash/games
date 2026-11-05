@@ -19,6 +19,7 @@ local Tutorial = require(script.Parent:WaitForChild("Tutorial"))
 local Merchant = require(script.Parent:WaitForChild("Merchant"))
 local Pages = require(script.Parent:WaitForChild("Pages"))
 local Ferry = require(script.Parent:WaitForChild("Ferry"))
+local TerrainBuilder = require(script.Parent:WaitForChild("TerrainBuilder"))
 
 -- ————————————————————— remotes ——————————————————————
 local remotes = Instance.new("Folder")
@@ -125,6 +126,14 @@ local function pushSync(playerObj: Player)
 end
 
 -- ————————————————————— world ——————————————————————
+-- voxel terrain base first so the world parts don't float over empty space
+local terrainOk, terrainErr = pcall(function()
+	TerrainBuilder.build()
+end)
+if not terrainOk then
+	warn("[Inkbound] TerrainBuilder failed:", terrainErr)
+end
+
 local world: any = nil
 local ok, err = pcall(function()
 	world = WorldBuilder.build("EnchantedRealm")

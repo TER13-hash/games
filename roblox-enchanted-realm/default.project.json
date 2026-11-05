@@ -25,7 +25,8 @@
       "Tutorial": { "$path": "src/ServerScriptService/Tutorial.luau" },
       "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" },
       "Pages": { "$path": "src/ServerScriptService/Pages.luau" },
-      "Ferry": { "$path": "src/ServerScriptService/Ferry.luau" }
+      "Ferry": { "$path": "src/ServerScriptService/Ferry.luau" },
+      "TerrainBuilder": { "$path": "src/ServerScriptService/TerrainBuilder.luau" }
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",

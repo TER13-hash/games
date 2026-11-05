@@ -57,6 +57,9 @@
       },
       "Ferry": {
         "$path": "roblox-enchanted-realm/src/ServerScriptService/Ferry.luau"
+      },
+      "TerrainBuilder": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/TerrainBuilder.luau"
       }
     },
     "StarterPlayer": {
