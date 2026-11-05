@@ -24,6 +24,8 @@ end
 
 function TerrainBuilder.build()
 	local terrain = workspace.Terrain
+	-- clear any default / leftover terrain so we don't stack our strip on a dome
+	terrain:Clear()
 	-- keep it shallow so it never swallows the hand-placed parts; just a bit of visual depth
 	for id, r in pairs(Regions.byId) do
 		local mat = materialFor(id)
