@@ -1,86 +1,46 @@
 {
-  "name": "games",
+  "name": "EnchantedRealm",
   "tree": {
     "$className": "DataModel",
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
       "Modules": {
         "$className": "Folder",
-        "Config": {
-          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/Config.luau"
-        },
-        "Regions": {
-          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/Regions.luau"
-        },
-        "SoundIDs": {
-          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/SoundIDs.luau"
-        },
-        "ExampleCounter": {
-          "$path": "roblox-enchanted-realm/src/Examples/ExampleCounter.luau"
-        }
+        "Config": { "$path": "src/ReplicatedStorage/Modules/Config.luau" },
+        "Regions": { "$path": "src/ReplicatedStorage/Modules/Regions.luau" },
+        "SoundIDs": { "$path": "src/ReplicatedStorage/Modules/SoundIDs.luau" },
+        "ExampleCounter": { "$path": "src/Examples/ExampleCounter.luau" }
       }
     },
     "ServerScriptService": {
       "$className": "ServerScriptService",
-      "Main": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Main.server.luau"
-      },
-      "Session": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Session.luau"
-      },
-      "WorldBuilder": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/WorldBuilder.luau"
-      },
-      "Enemies": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Enemies.luau"
-      },
-      "Bosses": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Bosses.luau"
-      },
-      "SaveData": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/SaveData.luau"
-      },
-      "LootChests": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/LootChests.luau"
-      },
-      "AdminCommands": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/AdminCommands.luau"
-      },
-      "Tutorial": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Tutorial.luau"
-      },
-      "Merchant": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Merchant.luau"
-      },
-      "Pages": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Pages.luau"
-      },
-      "Ferry": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/Ferry.luau"
-      },
-      "TerrainBuilder": {
-        "$path": "roblox-enchanted-realm/src/ServerScriptService/TerrainBuilder.luau"
-      }
+      "Main": { "$path": "src/ServerScriptService/Main.server.luau" },
+      "Session": { "$path": "src/ServerScriptService/Session.luau" },
+      "WorldBuilder": { "$path": "src/ServerScriptService/WorldBuilder.luau" },
+      "Enemies": { "$path": "src/ServerScriptService/Enemies.luau" },
+      "Bosses": { "$path": "src/ServerScriptService/Bosses.luau" },
+      "SaveData": { "$path": "src/ServerScriptService/SaveData.luau" },
+      "LootChests": { "$path": "src/ServerScriptService/LootChests.luau" },
+      "AdminCommands": { "$path": "src/ServerScriptService/AdminCommands.luau" },
+      "Tutorial": { "$path": "src/ServerScriptService/Tutorial.luau" },
+      "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" },
+      "Pages": { "$path": "src/ServerScriptService/Pages.luau" },
+      "Ferry": { "$path": "src/ServerScriptService/Ferry.luau" },
+      "TerrainBuilder": { "$path": "src/ServerScriptService/TerrainBuilder.luau" },
+      "RiverFerry": { "$path": "src/ServerScriptService/RiverFerry.server.luau" },
+      "FireflyAmbient": { "$path": "src/ServerScriptService/FireflyAmbient.server.luau" }
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",
       "StarterPlayerScripts": {
         "$className": "StarterPlayerScripts",
-        "GameClient": {
-          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau"
-        },
-        "Effects": {
-          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Effects.luau"
-        },
-        "TitleScreen": {
-          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau"
-        },
-        "PauseMenu": {
-          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau"
-        },
-        "Settings": {
-          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.luau"
-        }
+        "GameClient": { "$path": "src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau" },
+        "Effects": { "$path": "src/StarterPlayer/StarterPlayerScripts/Effects.luau" },
+        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau" },
+        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau" },
+        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.luau" },
+        "FireflyCompanion": { "$path": "src/StarterPlayer/StarterPlayerScripts/FireflyCompanion.client.luau" },
+        "WorldMap": { "$path": "src/StarterPlayer/StarterPlayerScripts/WorldMap.client.luau" }
       }
     },
     "Lighting": {
@@ -88,16 +48,8 @@
       "$properties": {
         "ClockTime": 14.5,
         "Brightness": 2.2,
-        "Ambient": [
-          0.18,
-          0.22,
-          0.2
-        ],
-        "OutdoorAmbient": [
-          0.25,
-          0.3,
-          0.28
-        ],
+        "Ambient": [0.18, 0.22, 0.2],
+        "OutdoorAmbient": [0.25, 0.3, 0.28],
         "FogEnd": 1200,
         "Technology": "Future"
       }
@@ -105,7 +57,7 @@
     "Workspace": {
       "$className": "Workspace",
       "$properties": {
-        "Gravity": 150,
+        "Gravity": 196.2,
         "StreamingEnabled": false
       }
     }

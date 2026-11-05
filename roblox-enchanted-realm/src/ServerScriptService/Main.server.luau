@@ -21,6 +21,12 @@ local Pages = require(script.Parent:WaitForChild("Pages"))
 local Ferry = require(script.Parent:WaitForChild("Ferry"))
 local TerrainBuilder = require(script.Parent:WaitForChild("TerrainBuilder"))
 
+-- we spawn characters ourselves (after the session exists) so they never appear at a wrong spot
+Players.CharacterAutoLoads = false
+local killPlayer: (any) -> ()
+local respawnPlayer: (any) -> ()
+local bossCenter: (string) -> Vector3
+
 -- ————————————————————— remotes ——————————————————————
 local remotes = Instance.new("Folder")
 remotes.Name = "InkboundRemotes"
@@ -105,6 +111,9 @@ local timeSynced = false
 
 RE.syncTime.OnServerEvent:Connect(function(player, hourFloat)
 	if typeof(hourFloat) ~= "number" then
+		return
+	end
+	if hourFloat ~= hourFloat or math.abs(hourFloat) == math.huge then
 		return
 	end
 	hourFloat = hourFloat % 24
@@ -253,6 +262,12 @@ end
 
 -- ————————————————————— player damage / death ——————————————————————
 local function hurtPlayer(s: Session.State, amount: number, source: string?)
+	if s.hp <= 0 then
+		return
+	end
+	if tick() < s.invulnerableUntil and source ~= "pit" then
+		return
+	end
 	Session.applyDamage(s, amount)
 	s.invulnerableUntil = tick() + Config.PLAYER.invulnerabilityTime
 	local char = s.player.Character
@@ -266,6 +281,7 @@ local function hurtPlayer(s: Session.State, amount: number, source: string?)
 end
 
 function killPlayer(s: Session.State)
+	s.burnUntil = 0
 	s.deaths += 1
 	s.dirty = true
 	RE.playSound:FireAllClients("GameOver", s.checkpointPos, 0.9)
@@ -305,7 +321,13 @@ local function setupCharacter(player: Player, char: Model)
 	local hrp = char:WaitForChild("HumanoidRootPart") :: BasePart
 	local hum = char:WaitForChild("Humanoid") :: Humanoid
 	hum.WalkSpeed = Config.PLAYER.baseSpeed
+	hum.UseJumpPower = true
 	hum.JumpPower = Config.PLAYER.jumpPower
+	local sess = Session.get(player)
+	if sess then
+		hrp.CFrame = CFrame.new(sess.checkpointPos + Vector3.new(0, 4, 0))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+	end
 	local conn: RBXScriptConnection
 	conn = RunService.Heartbeat:Connect(function()
 		if not char.Parent then
@@ -328,22 +350,27 @@ local function setupCharacter(player: Player, char: Model)
 	char:SetAttribute("ZLockConn", tostring(conn))
 end
 
-Players.PlayerAdded:Connect(function(player)
+local function onPlayerAdded(player: Player)
 	local s = Session.fresh(player)
 	player.CharacterAdded:Connect(function(char)
 		setupCharacter(player, char)
-		task.wait(0.1)
-		local hrp = char:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if hrp then
-			hrp.CFrame = CFrame.new(s.checkpointPos + Vector3.new(0, 4, 0))
-		end
 	end)
 	player:LoadCharacter()
-	pushSync(s)
-	Tutorial.onPlayer(RE, player)
-	RE.dialogue:FireClient(player, "mish_intro", "Mish: You're awake... you're in Encantadia now. The only way home is the Grand Key — held by Nukos, deep below.")
-	RE.narrator:FireClient(player, "Enchanted Realm: Inkbound", 4)
-end)
+	task.delay(3, function() -- let the client scripts load first
+		if not player.Parent then
+			return
+		end
+		pushSync(player)
+		Tutorial.onPlayer(RE, player)
+		RE.dialogue:FireClient(player, "mish_intro", "Mish: You're awake... you're in Encantadia now. The only way home is the Grand Key — held by Nukos, deep below.")
+		RE.narrator:FireClient(player, "Enchanted Realm: Inkbound", 4)
+	end)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, p in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, p)
+end
 
 -- ————————————————————— abilities / barriers ——————————————————————
 local ABILITY_CAST_LOCK: { [number]: number } = {}
@@ -402,7 +429,9 @@ local function breakBarrier(s: Session.State, barrier: BasePart)
 	else
 		Session.markBarrierBroken(s, btype)
 	end
-	objectiveText.Value = Config.OBJECTIVES.openElectric
+	if btype == "electric" then
+		objectiveText.Value = Config.OBJECTIVES.openElectric
+	end
 end
 
 for _, barrier in ipairs(world.barriers) do
@@ -437,6 +466,9 @@ for _, barrier in ipairs(world.barriers) do
 end
 
 RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aim: Vector3)
+	if typeof(abilityId) ~= "string" then
+		return
+	end
 	local s = Session.get(player)
 	if not s then
 		return
@@ -669,6 +701,9 @@ RE.swing.OnServerEvent:Connect(function(player, dirVec: Vector3)
 end)
 
 RE.interact.OnServerEvent:Connect(function(player, targetName: string)
+	if typeof(targetName) ~= "string" then
+		return
+	end
 	local s = Session.get(player)
 	if not s then
 		return
@@ -755,7 +790,8 @@ end
 for _, h in ipairs(world.hazards) do
 	hazardTouch(h)
 end
-local puddle = game:GetService("Workspace"):FindFirstChild("EnchantedRealm"):FindFirstChild("WaterPuddle") :: BasePart?
+local realmFolder = game:GetService("Workspace"):FindFirstChild("EnchantedRealm")
+local puddle = (realmFolder and realmFolder:FindFirstChild("WaterPuddle")) :: BasePart?
 if puddle then
 	puddle.Touched:Connect(function(hit)
 		local player = Players:GetPlayerFromCharacter(hit.Parent)
@@ -788,6 +824,9 @@ end)
 
 -- skills/shop purchases (the in-game SKILLS panel sends these)
 RE.buy.OnServerEvent:Connect(function(player, itemId: string)
+	if typeof(itemId) ~= "string" then
+		return
+	end
 	local s = Session.get(player)
 	if not s then
 		return
@@ -945,6 +984,7 @@ Players.PlayerRemoving:Connect(function(player)
 	if s then
 		Session.flush(s)
 	end
+	Session.remove(player)
 end)
 
 game:BindToClose(function()
