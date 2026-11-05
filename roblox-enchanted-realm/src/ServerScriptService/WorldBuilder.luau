@@ -629,10 +629,11 @@ function WorldBuilder.build(rootName: string)
 	end
 
 	-- the forest river: drowning hazard filling the gap (x 232..276)
+	-- fully below ground level (top at y=-1, ground top at y=0)
 	local drown = newPart({
 		name = "ForestRiver_Drowning",
-		size = Vector3.new(44, 8, 46),
-		cframe = CFrame.new(254, -3.5, 0),
+		size = Vector3.new(44, 6, 46),
+		cframe = CFrame.new(254, -4, 0),
 		color = Color3.fromRGB(20, 60, 110),
 		transparency = 1,
 		parent = hazardsFolder,

@@ -128,12 +128,6 @@ local function buildRaft(): (Model, BodyVelocity, BodyPosition)
 	bodyVel.Velocity = Vector3.new(0, 0, 0)
 	bodyVel.Parent = deck
 
-	local bodyPos = Instance.new("BodyPosition")
-	bodyPos.MaxForce = Vector3.new(0, math.huge, 0)
-	bodyPos.D = 900
-	bodyPos.Position = Vector3.new(DOCK_WEST, RAFT_Y, 0)
-	bodyPos.Parent = deck
-
 	local bodyGyro = Instance.new("BodyGyro")
 	bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
 	bodyGyro.D = 500
@@ -141,7 +135,7 @@ local function buildRaft(): (Model, BodyVelocity, BodyPosition)
 	bodyGyro.Parent = deck
 
 	model.Parent = game:GetService("Workspace")
-	return model, bodyVel, bodyPos
+	return model, bodyVel
 end
 
 function Ferry.init()
@@ -194,7 +188,7 @@ function Ferry.init()
 	waterDeep.Parent = world
 
 	-- raft
-	local model, bodyVel, bodyPos = buildRaft()
+	local model, bodyVel = buildRaft()
 
 	local direction = 1 -- 1 = eastward, -1 = westward
 	task.spawn(function()
@@ -203,19 +197,20 @@ function Ferry.init()
 			if direction == 1 and x >= DOCK_EAST then
 				direction = -1
 				bodyVel.Velocity = Vector3.new(0, 0, 0)
+				model.PrimaryPart.CFrame = CFrame.new(DOCK_EAST, RAFT_Y, 0)
 				for i = 1, DWELL * 10 do
 					task.wait(0.1)
 				end
 			elseif direction == -1 and x <= DOCK_WEST then
 				direction = 1
 				bodyVel.Velocity = Vector3.new(0, 0, 0)
+				model.PrimaryPart.CFrame = CFrame.new(DOCK_WEST, RAFT_Y, 0)
 				for i = 1, DWELL * 10 do
 					task.wait(0.1)
 				end
 			end
 
 			bodyVel.Velocity = Vector3.new(direction * SPEED, 0, 0)
-			bodyPos.Position = Vector3.new(if direction == 1 then DOCK_EAST else DOCK_WEST, RAFT_Y, 0)
 			task.wait(0.05)
 		end
 	end)
