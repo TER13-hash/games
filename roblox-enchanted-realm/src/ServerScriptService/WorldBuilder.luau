@@ -393,7 +393,7 @@ function WorldBuilder.build(rootName: string)
 			end
 			local block = newPart({
 				name = "Ground_" .. id,
-				size = Vector3.new(width, thickness, 16),
+				size = Vector3.new(width, thickness, 48),
 				cframe = CFrame.new(cx, cy, 0),
 				color = groundColor,
 				material = groundMat,
@@ -403,7 +403,7 @@ function WorldBuilder.build(rootName: string)
 				-- ink-black floating island underside
 				newPart({
 					name = "IslandUnderside",
-					size = Vector3.new(width * 0.72, 5, 10),
+					size = Vector3.new(width * 0.72, 5, 26),
 					cframe = CFrame.new(cx, topY - thickness - 2.4, 0),
 					color = Color3.fromRGB(10, 10, 12),
 					material = Enum.Material.SmoothPlastic,
@@ -415,7 +415,7 @@ function WorldBuilder.build(rootName: string)
 		for _, c in ipairs(r.ceilings or {}) do
 			newPart({
 				name = "Ceiling_" .. id,
-				size = Vector3.new(c.x1 - c.x0, c.h, 16),
+				size = Vector3.new(c.x1 - c.x0, c.h, 48),
 				cframe = CFrame.new((c.x0 + c.x1) / 2, c.y + c.h / 2, 0),
 				color = Color3.fromRGB(20, 18, 22),
 				material = Enum.Material.Rock,
@@ -789,6 +789,22 @@ function WorldBuilder.build(rootName: string)
 	spawn.Transparency = 1
 	spawn.CanCollide = false
 	spawn.Parent = root
+
+	-- full 3D: invisible Z walls so the player cannot leave the corridor
+	for _, side in ipairs({ -1, 1 }) do
+		local zWall = newPart({
+			name = "ZBoundary_" .. (side < 0 and "Negative" or "Positive"),
+			size = Vector3.new(2900, 140, 1),
+			cframe = CFrame.new((Config.WORLD.minX + Config.WORLD.maxX) / 2, 30, side * 23.5),
+			color = Color3.fromRGB(0, 0, 0),
+			material = Enum.Material.SmoothPlastic,
+			transparency = 1,
+			canQuery = false,
+			parent = root,
+		})
+		zWall.CanCollide = true
+		zWall.CanTouch = false
+	end
 
 	return built
 end

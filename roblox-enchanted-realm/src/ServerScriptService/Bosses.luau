@@ -483,7 +483,7 @@ local function telegraphedStrike(x: number, delayTime: number, radius: number, d
 		bolt.Parent = game:GetService("Workspace")
 		Debris:AddItem(bolt, 0.35)
 		local _, _, hrp = currentPlayerChar()
-		if hrp and math.abs(hrp.Position.X - x) < radius and hrp.Position.Y < 30 then
+		if hrp and math.abs(hrp.Position.X - x) < radius and math.abs(hrp.Position.Z) < radius and hrp.Position.Y < 30 then
 			if onPlayerDamaged then
 				onPlayerDamaged(damage, Vector3.new(x, 1, 0), name)
 			end
@@ -531,7 +531,7 @@ local function groundSpikes(originX: number, direction: number, count: number, d
 			Debris:AddItem(spike, 1.6)
 			Debris:AddItem(tip, 1.6)
 			local _, _, hrp = currentPlayerChar()
-			if hrp and math.abs(hrp.Position.X - sx) < 2.2 and hrp.Position.Y < h + 1.5 then
+			if hrp and math.abs(hrp.Position.X - sx) < 2.2 and math.abs(hrp.Position.Z) < 3.2 and hrp.Position.Y < h + 1.5 then
 				if onPlayerDamaged then
 					onPlayerDamaged(damage, Vector3.new(sx, 1, 0), "Ice Spike")
 				end
@@ -772,15 +772,17 @@ local function tick(dt: number)
 				continue
 			end
 			local px = hrp.Position.X
+			local dz = hrp.Position.Z
 			local dx = px - boss.x
 			local dist = math.abs(dx)
+			local distXZ = Vector3.new(dx, 0, dz).Magnitude
 			local dir = if dx >= 0 then 1 else -1
 			local profile = boss.def
 
 			-- electricity strip damage? (environmental, handled by Main via hazards)
 
 			-- contact damage
-			if dist < 4.6 and hrp.Position.Y < boss.y + 12 then
+			if distXZ < 4.6 and hrp.Position.Y < boss.y + 12 then
 				if now - boss.lastContactDamage > 1.2 then
 					boss.lastContactDamage = now
 					if onPlayerDamaged then
@@ -811,7 +813,7 @@ local function tick(dt: number)
 				telegraphedStrike(chargeX, 0.6, 3.2, 0, boss.def.color, "Enrage Charge")
 				task.delay(0.6, function()
 					if onPlayerDamaged and hrp and hrp.Parent then
-						if math.abs(hrp.Position.X - chargeX) < 3.6 then
+						if math.abs(hrp.Position.X - chargeX) < 3.6 and math.abs(hrp.Position.Z) < 4.2 then
 							onPlayerDamaged(math.floor(profile.damage * 1.3), bossCenter(boss), "Enrage Charge")
 						end
 					end
@@ -834,7 +836,7 @@ local function tick(dt: number)
 					telegraphedStrike(tx, 0.75, 2.2, 0, Color3.fromRGB(150, 230, 255), "Energy Beam")
 					task.delay(0.75, function()
 						if onPlayerDamaged and hrp and hrp.Parent then
-							if math.abs(hrp.Position.X - tx) < 2.6 and hrp.Position.Y < 25 then
+							if math.abs(hrp.Position.X - tx) < 2.6 and math.abs(hrp.Position.Z) < 3.5 and hrp.Position.Y < 25 then
 								onPlayerDamaged(18, Vector3.new(tx, hrp.Position.Y, 0), "Energy Beam")
 							end
 						end
@@ -874,7 +876,9 @@ local function tick(dt: number)
 						if hrp and hrp.Parent then
 							local d = math.abs(hrp.Position.X - boss.x)
 							if math.abs(d - radius) < 2.4 and pulse.Transparency < 0.9 then
-								hrp.AssemblyLinearVelocity = Vector3.new(if hrp.Position.X >= boss.x then 48 else -48, 16, 0)
+								local away = hrp.Position - Vector3.new(boss.x, hrp.Position.Y, 0)
+								local awayDir = if away.Magnitude > 0.01 then Vector3.new(away.X, 0, away.Z).Unit else Vector3.new(1, 0, 0)
+								hrp.AssemblyLinearVelocity = Vector3.new(awayDir.X * 48, 16, awayDir.Z * 48)
 								if onPlayerDamaged then
 									onPlayerDamaged(8, bossCenter(boss), "Shield Pulse")
 								end
@@ -921,8 +925,10 @@ local function tick(dt: number)
 							events.VFX:FireAllClients("pillarCrash", Vector3.new(boss.x, 3, 0), Color3.fromRGB(255, 220, 140))
 							events.BossAttack:FireAllClients("pillarCrash", boss.x)
 						end
-					elseif hrp and math.abs(hrp.Position.X - boss.x) < 4 and hrp.Parent then
-						hrp.AssemblyLinearVelocity = Vector3.new(dashDir * 40, 14, 0)
+					elseif hrp and math.abs(hrp.Position.X - boss.x) < 4 and math.abs(hrp.Position.Z) < 4.5 and hrp.Parent then
+						local away1 = hrp.Position - Vector3.new(boss.x, hrp.Position.Y, 0)
+						local awayDir1 = if away1.Magnitude > 0.01 then Vector3.new(away1.X, 0, away1.Z).Unit else Vector3.new(1, 0, 0)
+						hrp.AssemblyLinearVelocity = Vector3.new(awayDir1.X * 40, 14, awayDir1.Z * 40)
 						if onPlayerDamaged then
 							onPlayerDamaged(profile.damage, bossCenter(boss), "Dash Attack")
 						end
@@ -930,8 +936,10 @@ local function tick(dt: number)
 				-- slam
 				elseif dist <= 7.5 and ready(boss, "slam", now) then
 					pickCooldown(boss, "slam", now, 2.3)
-					if hrp and math.abs(hrp.Position.X - boss.x) < 7 then
-						hrp.AssemblyLinearVelocity = Vector3.new(if dx >= 0 then 26 else -26, 22, 0)
+					if hrp and math.abs(hrp.Position.X - boss.x) < 7 and math.abs(hrp.Position.Z) < 6.5 then
+						local away2 = hrp.Position - Vector3.new(boss.x, hrp.Position.Y, 0)
+						local awayDir2 = if away2.Magnitude > 0.01 then Vector3.new(away2.X, 0, away2.Z).Unit else Vector3.new(1, 0, 0)
+						hrp.AssemblyLinearVelocity = Vector3.new(awayDir2.X * 26, 22, awayDir2.Z * 26)
 						if onPlayerDamaged then
 							onPlayerDamaged(profile.damage, bossCenter(boss), "Hammer Slam")
 						end
@@ -966,7 +974,7 @@ local function tick(dt: number)
 						conn = RunService.Heartbeat:Connect(function(step)
 							local age = os.clock() - t0
 							wall.CFrame = wall.CFrame + Vector3.new(side * 14 * step, 0, 0)
-							if hrp and hrp.Parent and math.abs(hrp.Position.X - wall.Position.X) < 2.4 and hrp.Position.Y < 4.5 then
+							if hrp and hrp.Parent and math.abs(hrp.Position.X - wall.Position.X) < 2.4 and math.abs(hrp.Position.Z - wall.Position.Z) < 3 and hrp.Position.Y < 4.5 then
 								if onPlayerDamaged then
 									onPlayerDamaged(10, wall.Position, "Fire Wall")
 								end
@@ -1059,7 +1067,7 @@ local function tick(dt: number)
 					pickCooldown(boss, "orb", now, 4.4)
 					local origin = bossCenter(boss)
 					local to = hrp.Position - origin
-					local flat = Vector3.new(to.X, 0, 0)
+					local flat = Vector3.new(to.X, 0, to.Z)
 					local dirV = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(1, 0, 0)
 					projectile(origin, dirV + Vector3.new(0, 0.35, 0), 40, 14, Color3.fromRGB(255, 240, 130), "Thunder Orb", true, 3.5)
 					if events then
@@ -1069,7 +1077,8 @@ local function tick(dt: number)
 				-- wind blast every 5s; then she regains power (vulnerable)
 				if ready(boss, "windblast", now) then
 					pickCooldown(boss, "windblast", now, 5)
-					hrp.AssemblyLinearVelocity = Vector3.new(if dx >= 0 then 60 else -60, 10, 0)
+					local flatDir = Vector3.new(dx, 0, hrp.Position.Z)
+					hrp.AssemblyLinearVelocity = flatDir.Magnitude > 0.01 and Vector3.new(flatDir.Unit.X * 60, 10, flatDir.Unit.Z * 60) or Vector3.new(60, 10, 0)
 					boss.regainUntil = now + 2.4
 					if onPlayerDamaged then
 						onPlayerDamaged(8, bossCenter(boss), "Wind Blast")

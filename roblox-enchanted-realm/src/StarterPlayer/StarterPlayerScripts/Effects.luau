@@ -113,7 +113,8 @@ end
 
 -- —————— public vfx ——————
 
-function Effects.swing(origin: Vector3, dir: number, hit: boolean)
+function Effects.swing(origin: Vector3, dir: Vector3, hit: boolean)
+	local look = if dir and dir.Magnitude > 0.01 then Vector3.new(dir.X, 0, dir.Z).Unit else Vector3.new(1, 0, 0)
 	local slash = Instance.new("Part")
 	slash.Name = "SlashFX"
 	slash.Anchored = true
@@ -121,13 +122,14 @@ function Effects.swing(origin: Vector3, dir: number, hit: boolean)
 	slash.CanQuery = false
 	slash.Material = Enum.Material.Neon
 	slash.Color = hit and Color3.fromRGB(255, 230, 140) or Color3.fromRGB(140, 160, 200)
-	slash.Size = Vector3.new(4.5, 3.6, 0.8)
-	slash.CFrame = CFrame.new(origin + Vector3.new(dir * 2, 1.3, 0)) * CFrame.Angles(0, 0, dir > 0 and math.rad(-35) or math.rad(145))
+	slash.Size = Vector3.new(0.8, 3.6, 4.5)
+	local center = origin + Vector3.new(0, 1.3, 0) + look * 2
+	slash.CFrame = CFrame.lookAt(center, center + look) * CFrame.Angles(0, 0, math.rad(-35))
 	slash.Parent = workspace
-	TweenService:Create(slash, TweenInfo.new(0.1), { Transparency = 1, Size = Vector3.new(9, 6, 1.4) }):Play()
+	TweenService:Create(slash, TweenInfo.new(0.1), { Transparency = 1, Size = Vector3.new(1.4, 6, 9) }):Play()
 	Debris:AddItem(slash, 0.14)
 	if hit then
-		burst(origin + Vector3.new(dir * 2.2, 1.3, 0), Color3.fromRGB(255, 200, 120), 16, 0.9)
+		burst(origin + look * 2.2 + Vector3.new(0, 1.3, 0), Color3.fromRGB(255, 200, 120), 16, 0.9)
 	end
 end
 

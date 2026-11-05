@@ -42,19 +42,20 @@ local RE = {
 	respawn = remotes:WaitForChild("RespawnRequest"),
 	win = remotes:WaitForChild("GameWon"),
 	sync = remotes:WaitForChild("StateSync"),
+	buy = remotes:WaitForChild("BuyItem", 5),
+	awaken = remotes:WaitForChild("Awaken"),
+	syncTime = remotes:WaitForChild("SyncTime"),
 }
 
 -- simulation state
 local character: Model? = nil
 local hrp: BasePart? = nil
 local hum: Humanoid? = nil
-local facing = 1
 local grounded = false
 local canDoubleJump = true
 local coyoteUntil = 0
 local attackAnimating = false
 local castLockUntil = 0
-local moveDir = 0 -- set by keyboard AND touch D-pad
 
 -- ui state
 local paused = false
@@ -89,6 +90,7 @@ local function drawHUD(payload: any)
 	setFill(hpFill, payload.hp / payload.maxHp)
 	setFill(inkFill, payload.ink / payload.maxInk)
 	setFill(xpFill, payload.xp / payload.xpNext)
+	inkFill.BackgroundColor3 = if payload.ink >= payload.maxInk then Color3.fromRGB(255, 215, 120) else Color3.fromRGB(140, 225, 255)
 	levelLabel.Text = "LV " .. payload.level
 	for id, btn in pairs(abilityBtns) do
 		local known = (payload.abilities :: any)[id] == true
@@ -305,6 +307,35 @@ for i, id in ipairs(ABILITY_ORDER) do
 	cooldownOverlays[id] = cd
 end
 
+-- —————— clock (follows the player's local time) ——————
+local clockLabel = Instance.new("TextLabel")
+clockLabel.Name = "Clock"
+clockLabel.BackgroundTransparency = 1
+clockLabel.Size = UDim2.new(0, 130, 0, 24)
+clockLabel.Position = UDim2.new(1, -10, 0, 10)
+clockLabel.Font = Enum.Font.Bangers
+clockLabel.Text = ""
+clockLabel.TextColor3 = Color3.fromRGB(235, 225, 205)
+clockLabel.TextScaled = true
+clockLabel.TextXAlignment = Enum.TextXAlignment.Right
+clockLabel.TextStrokeTransparency = 0.55
+clockLabel.ZIndex = 6
+clockLabel.Parent = frame
+
+task.spawn(function()
+	while true do
+		local t = os.date("*t")
+		local hour = t.hour
+		local ampm = hour >= 12 and "PM" or "AM"
+		local h12 = hour % 12
+		if h12 == 0 then
+			h12 = 12
+		end
+		clockLabel.Text = string.format("%d:%02d %s", h12, t.min, ampm)
+		task.wait(1)
+	end
+end)
+
 -- boss health bar
 bossBar = Instance.new("Frame")
 bossBar.Name = "BossBar"
@@ -342,6 +373,256 @@ bossFill.Size = UDim2.new(1, 0, 1, 0)
 bossFill.Parent = bossBarInner
 local bfCorner = Instance.new("UICorner")
 bfCorner.CornerRadius = UDim.new(0, 4)
+-- —————— awaken + skills ——————
+
+local function makeHudButton(name: string, text: string, pos: UDim2, callback: () -> ()): TextButton
+	local b = Instance.new("TextButton")
+	b.Name = name
+	b.BackgroundColor3 = Color3.fromRGB(30, 26, 36)
+	b.BackgroundTransparency = 0.15
+	b.BorderSizePixel = 0
+	b.Size = UDim2.new(0, 92, 0, 34)
+	b.Position = pos
+	b.Font = Enum.Font.Bangers
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(255, 240, 210)
+	b.TextScaled = true
+	b.ZIndex = 6
+	b.Parent = frame
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = b
+	local s = Instance.new("UIStroke")
+	s.Color = Color3.fromRGB(70, 60, 80)
+	s.Thickness = 2
+	s.Parent = b
+	b.Activated:Connect(callback)
+	return b
+end
+
+local awakenBtn = makeHudButton("AwakenBtn", "AWAKEN", UDim2.new(1, -222, 0, 44), function()
+	RE.awaken:FireServer()
+end)
+
+-- skills & shop panel
+local skillsOpen = false
+local skillsPanel = Instance.new("Frame")
+skillsPanel.Name = "SkillsPanel"
+skillsPanel.BackgroundColor3 = Color3.fromRGB(8, 6, 12)
+skillsPanel.BackgroundTransparency = 0.35
+skillsPanel.BorderSizePixel = 0
+skillsPanel.Size = UDim2.new(1, 0, 1, 0)
+skillsPanel.ZIndex = 32
+skillsPanel.Visible = false
+skillsPanel.Parent = gui
+local panelBox = Instance.new("Frame")
+panelBox.Name = "PanelBox"
+panelBox.BackgroundColor3 = Color3.fromRGB(16, 13, 22)
+panelBox.BorderSizePixel = 0
+panelBox.Size = UDim2.new(0, 620, 0, 460)
+panelBox.Position = UDim2.new(0.5, -310, 0.5, -230)
+panelBox.ZIndex = 33
+panelBox.Parent = skillsPanel
+local pbc = Instance.new("UICorner")
+pbc.CornerRadius = UDim.new(0, 16)
+pbc.Parent = panelBox
+local pbStroke = Instance.new("UIStroke")
+pbStroke.Color = Color3.fromRGB(80, 68, 96)
+pbStroke.Thickness = 2
+pbStroke.Parent = panelBox
+local pTitle = Instance.new("TextLabel")
+pTitle.Name = "Title"
+pTitle.BackgroundTransparency = 1
+pTitle.Size = UDim2.new(1, 0, 0, 42)
+pTitle.Position = UDim2.new(0, 0, 0, 8)
+pTitle.Font = Enum.Font.Bangers
+pTitle.Text = "SKILLS & SHOP"
+pTitle.TextColor3 = Color3.fromRGB(255, 235, 160)
+pTitle.TextScaled = true
+pTitle.ZIndex = 34
+pTitle.Parent = panelBox
+local pSub = Instance.new("TextLabel")
+pSub.Name = "Sub"
+pSub.BackgroundTransparency = 1
+pSub.Size = UDim2.new(1, 0, 0, 15)
+pSub.Position = UDim2.new(0, 0, 0, 46)
+pSub.Font = Enum.Font.Gotham
+pSub.Text = "XP is spent for good. Haste is your enemy."
+pSub.TextColor3 = Color3.fromRGB(150, 145, 165)
+pSub.TextScaled = true
+pSub.ZIndex = 34
+pSub.Parent = panelBox
+local pClose = Instance.new("TextButton")
+pClose.Name = "CloseSkills"
+pClose.BackgroundColor3 = Color3.fromRGB(40, 32, 46)
+pClose.BorderSizePixel = 0
+pClose.Size = UDim2.new(0, 32, 0, 32)
+pClose.Position = UDim2.new(1, -42, 0, 8)
+pClose.Font = Enum.Font.Bangers
+pClose.Text = "X"
+pClose.TextColor3 = Color3.fromRGB(255, 240, 210)
+pClose.TextScaled = true
+pClose.ZIndex = 35
+pClose.Parent = panelBox
+local pcc = Instance.new("UICorner")
+pcc.CornerRadius = UDim.new(0, 8)
+pcc.Parent = pClose
+local rowsHolder = Instance.new("Frame")
+rowsHolder.Name = "Rows"
+rowsHolder.BackgroundTransparency = 1
+rowsHolder.Size = UDim2.new(1, -20, 1, -78)
+rowsHolder.Position = UDim2.new(0, 10, 0, 66)
+rowsHolder.ZIndex = 34
+rowsHolder.Parent = panelBox
+
+local refreshSkillsPanel: () -> ()
+local function clearRows()
+	for _, c in ipairs(rowsHolder:GetChildren()) do
+		c:Destroy()
+	end
+end
+local BOSS_HINTS = {
+	lightning = "Sealed — defeat the Mechanical Guardian",
+	powerRock = "Sealed — defeat the Machine Warrior",
+	fire = "Sealed — defeat the Fire Guardian",
+	ice = "Sealed — defeat the Ice Guardian",
+	wind = "Sealed — defeat the Storm Guardian",
+	lightningCore = "Sealed — defeat Nukos",
+}
+local rowIndex = 0
+local function addRow(icon: string, iconColor: Color3, name: string, desc: string, status: string, statusColor: Color3, buyId: string?)
+	rowIndex += 1
+	local row = Instance.new("Frame")
+	row.BackgroundColor3 = Color3.fromRGB(24, 20, 30)
+	row.BorderSizePixel = 0
+	row.Size = UDim2.new(1, 0, 0, 27)
+	row.Position = UDim2.new(0, 0, 0, (rowIndex - 1) * 31)
+	row.ZIndex = 34
+	row.Parent = rowsHolder
+	local rc = Instance.new("UICorner")
+	rc.CornerRadius = UDim.new(0, 8)
+	rc.Parent = row
+	local iconLbl = Instance.new("TextLabel")
+	iconLbl.BackgroundTransparency = 1
+	iconLbl.Size = UDim2.new(0, 28, 1, 0)
+	iconLbl.Position = UDim2.new(0, 4, 0, 0)
+	iconLbl.Font = Enum.Font.Bangers
+	iconLbl.Text = icon
+	iconLbl.TextColor3 = iconColor
+	iconLbl.TextScaled = true
+	iconLbl.ZIndex = 35
+	iconLbl.Parent = row
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Size = UDim2.new(0.46, 0, 0, 14)
+	nameLbl.Position = UDim2.new(0, 36, 0, 1)
+	nameLbl.Font = Enum.Font.Bangers
+	nameLbl.Text = name
+	nameLbl.TextColor3 = Color3.fromRGB(255, 240, 210)
+	nameLbl.TextScaled = true
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.ZIndex = 35
+	nameLbl.Parent = row
+	local descLbl = Instance.new("TextLabel")
+	descLbl.BackgroundTransparency = 1
+	descLbl.Size = UDim2.new(0.46, 0, 0, 12)
+	descLbl.Position = UDim2.new(0, 36, 0, 15)
+	descLbl.Font = Enum.Font.Gotham
+	descLbl.Text = desc
+	descLbl.TextColor3 = Color3.fromRGB(150, 145, 165)
+	descLbl.TextScaled = true
+	descLbl.TextXAlignment = Enum.TextXAlignment.Left
+	descLbl.ZIndex = 35
+	descLbl.Parent = row
+	if buyId then
+		local buyBtn = Instance.new("TextButton")
+		buyBtn.Size = UDim2.new(0, 128, 0, 20)
+		buyBtn.Position = UDim2.new(1, -136, 0, 3)
+		buyBtn.BackgroundColor3 = Color3.fromRGB(63, 96, 74)
+		buyBtn.BorderSizePixel = 0
+		buyBtn.Font = Enum.Font.Bangers
+		buyBtn.Text = "BUY — " .. status
+		buyBtn.TextColor3 = Color3.fromRGB(255, 240, 210)
+		buyBtn.TextScaled = true
+		buyBtn.ZIndex = 36
+		buyBtn.Parent = row
+		local bbc = Instance.new("UICorner")
+		bbc.CornerRadius = UDim.new(0, 7)
+		bbc.Parent = buyBtn
+		buyBtn.Activated:Connect(function()
+			RE.buy:FireServer(buyId)
+			buyBtn.Text = "…"
+			task.delay(0.4, function()
+				(refreshSkillsPanel :: () -> ())()
+			end)
+		end)
+	else
+		local tag = Instance.new("TextLabel")
+		tag.BackgroundTransparency = 1
+		tag.Size = UDim2.new(0, 128, 1, 0)
+		tag.Position = UDim2.new(1, -132, 0, 0)
+		tag.Font = Enum.Font.Bangers
+		tag.Text = status
+		tag.TextColor3 = statusColor
+		tag.TextScaled = true
+		tag.TextXAlignment = Enum.TextXAlignment.Right
+		tag.ZIndex = 35
+		tag.Parent = row
+	end
+end
+
+refreshSkillsPanel = function()
+	clearRows()
+	rowIndex = 0
+	local payload = gui:GetAttribute("LastPayload") :: any?
+	local xp = payload and payload.xp or 0
+	local roles = payload and payload.roles or {}
+	local jobs = payload and payload.jobs or {}
+	local pages = payload and payload.pages or {}
+	local maxHp = payload and payload.maxHp or Config.PLAYER.baseHealth
+	local maxInk = payload and payload.maxInk or Config.INK.max
+	local level = payload and payload.level or 1
+	local baseHp = Config.PLAYER.baseHealth + Config.PLAYER.levelHealthBonus * (level - 1)
+	local hearts = math.max(0, math.floor((maxHp - baseHp) / Config.PLAYER.heartBonus))
+	local satchels = math.max(0, math.floor((maxInk - Config.INK.max) / 25))
+	local pageCount = 0
+	for _ in pairs(pages) do
+		pageCount += 1
+	end
+
+	addRow("»", Color3.fromRGB(200, 190, 230), "Ink Memories", "Hidden lore pages in the world (" .. pageCount .. "/8 found)", pageCount .. " / 8", Color3.fromRGB(255, 215, 120), nil)
+	for key, def in pairs(Config.STYLES) do
+		local rank = roles[key] or 0
+		local status = if rank >= 3 then "MAXED" else "150 XP"
+		local color = if rank >= 3 then Color3.fromRGB(150, 220, 150) else Color3.fromRGB(255, 215, 110)
+		addRow(def.icon, def.color, def.name .. " — Rank " .. rank .. "/3", def.desc, status, color, rank < 3 and ("style_" .. key) or nil)
+	end
+	for key, def in pairs(Config.JOBS) do
+		local rank = jobs[key] or 0
+		local status = if rank >= 3 then "MAXED" else "150 XP"
+		local color = if rank >= 3 then Color3.fromRGB(150, 220, 150) else Color3.fromRGB(255, 215, 110)
+		addRow(def.icon, def.color, def.name .. " — Rank " .. rank .. "/3", def.desc, status, color, rank < 3 and ("job_" .. key) or nil)
+	end
+	local tomeOwned = (payload and payload.abilities or {}).shockwave == true
+	addRow("◎", Color3.fromRGB(150, 215, 255), "Tome of Shockwave", "AoE damage around you — press [7]", tomeOwned and "OWNED" or "200 XP", tomeOwned and Color3.fromRGB(150, 220, 150) or Color3.fromRGB(255, 215, 110), not tomeOwned and "shockwave" or nil)
+	addRow("◆", Color3.fromRGB(140, 225, 255), "Ink Satchel — " .. satchels .. "/3", "+25 max ink, permanent", satchels >= 3 and "MAXED" or "150 XP", satchels >= 3 and Color3.fromRGB(150, 220, 150) or Color3.fromRGB(255, 215, 110), satchels < 3 and "satchel" or nil)
+	addRow("♥", Color3.fromRGB(255, 130, 150), "Heart Container — " .. hearts .. "/3", "+20 max HP, permanent", hearts >= 3 and "MAXED" or "150 XP", hearts >= 3 and Color3.fromRGB(150, 220, 150) or Color3.fromRGB(255, 215, 110), hearts < 3 and "heart" or nil)
+	addRow("✦", Color3.fromRGB(255, 215, 110), "Ink Potion", "Refill your ink meter to full", "10 XP", Color3.fromRGB(255, 215, 110), "potion")
+end
+
+local skillsBtn = makeHudButton("SkillsBtn", "SKILLS", UDim2.new(1, -114, 0, 44), function()
+	skillsOpen = not skillsOpen
+	skillsPanel.Visible = skillsOpen
+	if skillsOpen then
+		refreshSkillsPanel()
+	end
+end)
+
+pClose.Activated:Connect(function()
+	skillsOpen = false
+	skillsPanel.Visible = false
+end)
+
 bfCorner.Parent = bossFill
 
 -- forward declarations for mobile buttons
@@ -352,52 +633,7 @@ local function doInteract_forward() doInteract() end
 -- mobile touch controls
 if isMobile then
 	local padSize = 64
-	local dpad = Instance.new("Frame")
-	dpad.Name = "DPad"
-	dpad.BackgroundTransparency = 1
-	dpad.Size = UDim2.new(0, padSize * 2 + 16, 0, padSize + 16)
-	dpad.Position = UDim2.new(0, 22, 1, -(padSize + 44))
-	dpad.Parent = frame
-
-	local function dpadBtn(name: string, xScale: number, text: string): TextButton
-		local b = Instance.new("TextButton")
-		b.Name = name
-		b.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-		b.BackgroundTransparency = 0.82
-		b.BorderSizePixel = 0
-		b.Size = UDim2.new(0, padSize, 0, padSize)
-		b.Position = UDim2.new(xScale, 0, 0.5, -padSize / 2)
-		b.Font = Enum.Font.Bangers
-		b.Text = text
-		b.TextColor3 = Color3.fromRGB(255, 245, 220)
-		b.TextScaled = true
-		b.Parent = frame -- parent to frame so it's above dpad visually? no, parent to dpad
-		b.Parent = dpad
-		local c = Instance.new("UICorner")
-		c.CornerRadius = UDim.new(0, 18)
-		c.Parent = b
-		local s = Instance.new("UIStroke")
-		s.Color = Color3.fromRGB(255, 255, 255)
-		s.Transparency = 0.5
-		s.Thickness = 2
-		s.Parent = b
-		return b
-	end
-
-	local btnLeft = dpadBtn("LeftBtn", 0, "◀")
-	local btnRight = dpadBtn("RightBtn", 1, "▶") :: TextButton
-	btnRight.Position = UDim2.new(1, -padSize, 0.5, -padSize / 2)
-
-	local function press(side: number)
-		moveDir = side
-		facing = side
-	end
-	btnLeft.MouseButton1Down:Connect(function() press(-1) end)
-	btnLeft.MouseButton1Up:Connect(function() if moveDir == -1 then moveDir = 0 end end)
-	btnRight.MouseButton1Down:Connect(function() press(1) end)
-	btnRight.MouseButton1Up:Connect(function() if moveDir == 1 then moveDir = 0 end end)
-
-	local actions = Instance.new("Frame")
+	-- (custom D-pad removed — full 3D uses Roblox's built-in touch controls)	local actions = Instance.new("Frame")
 	actions.Name = "Actions"
 	actions.BackgroundTransparency = 1
 	actions.Size = UDim2.new(0, padSize * 2 + 32, 0, padSize + 16)
@@ -439,6 +675,388 @@ if isMobile then
 	interactBtn.Position = UDim2.new(0.5, -actBtnSize / 2, 0.22, -actBtnSize / 2)
 end
 
+-- —————— tactical map (flat atlas view) ——————
+
+local MAP_ZONES = {
+	{ key = "forest",      name = "ENCHANTED FOREST", minX = 0,    maxX = 400,  color = Color3.fromRGB(66, 116, 66)  },
+	{ key = "ruins",       name = "MECHANICAL RUINS", minX = 416,  maxX = 760,  color = Color3.fromRGB(110, 96, 66)  },
+	{ key = "burning",     name = "BURNING FOREST",   minX = 776,  maxX = 1010, color = Color3.fromRGB(132, 72, 48)  },
+	{ key = "frozen",      name = "FROZEN RUINS",     minX = 1026, maxX = 1285, color = Color3.fromRGB(88, 120, 152) },
+	{ key = "cave",        name = "SECRET CAVE",      minX = 1301, maxX = 1490, color = Color3.fromRGB(88, 66, 116)  },
+	{ key = "sky",         name = "SKY RUINS",        minX = 1490, maxX = 2015, color = Color3.fromRGB(96, 118, 142) },
+	{ key = "underground", name = "UNDERGROUND",      minX = 2015, maxX = 2680, color = Color3.fromRGB(48, 40, 52)   },
+}
+local MAP_BOSSES = {
+	{ kind = "mechanical", x = 345,  label = "KIDLAT"   },
+	{ kind = "machine",    x = 712,  label = "PIYEDRO"  },
+	{ kind = "fire",       x = 955,  label = "PEYRO"    },
+	{ kind = "ice",        x = 1250, label = "DAN"      },
+	{ kind = "storm",      x = 1962, label = "MAAM JYR" },
+	{ kind = "squid",      x = 2545, label = "NUKOS"    },
+}
+local WORLD_SPAN = 2680
+local mapOpen = false
+local youMarker: TextLabel
+
+local mapPanel = Instance.new("Frame")
+mapPanel.Name = "TacticalMap"
+mapPanel.BackgroundColor3 = Color3.fromRGB(8, 6, 12)
+mapPanel.BackgroundTransparency = 0.25
+mapPanel.BorderSizePixel = 0
+mapPanel.Size = UDim2.new(1, 0, 1, 0)
+mapPanel.ZIndex = 32
+mapPanel.Visible = false
+mapPanel.Parent = gui
+local mapBox = Instance.new("Frame")
+mapBox.Name = "PanelBox"
+mapBox.BackgroundColor3 = Color3.fromRGB(11, 18, 26)
+mapBox.Size = UDim2.new(0, 900, 0, 470)
+mapBox.Position = UDim2.new(0.5, -450, 0.5, -235)
+mapBox.BorderSizePixel = 0
+mapBox.ZIndex = 33
+mapBox.Parent = mapPanel
+local mbc = Instance.new("UICorner")
+mbc.CornerRadius = UDim.new(0, 16)
+mbc.Parent = mapBox
+local mbStroke = Instance.new("UIStroke")
+mbStroke.Color = Color3.fromRGB(90, 110, 140)
+mbStroke.Thickness = 2
+mbStroke.Parent = mapBox
+
+local mapTitle = Instance.new("TextLabel")
+mapTitle.Name = "Title"
+mapTitle.BackgroundTransparency = 1
+mapTitle.Size = UDim2.new(0.8, 0, 0, 40)
+mapTitle.Position = UDim2.new(0, 20, 0, 8)
+mapTitle.Font = Enum.Font.Bangers
+mapTitle.Text = "TACTICAL MAP — INKBOUND REALM"
+mapTitle.TextColor3 = Color3.fromRGB(190, 255, 190)
+mapTitle.TextScaled = true
+mapTitle.TextXAlignment = Enum.TextXAlignment.Left
+mapTitle.ZIndex = 34
+mapTitle.Parent = mapBox
+
+-- ocean canvas
+local ocean = Instance.new("Frame")
+ocean.Name = "Ocean"
+ocean.Size = UDim2.new(1, -40, 1, -120)
+ocean.Position = UDim2.new(0, 20, 0, 62)
+ocean.BorderSizePixel = 0
+ocean.BackgroundColor3 = Color3.fromRGB(24, 46, 66)
+ocean.ZIndex = 34
+ocean.Parent = mapBox
+local oc = Instance.new("UICorner")
+oc.CornerRadius = UDim.new(0, 14)
+oc.Parent = ocean
+local ocGradient = Instance.new("UIGradient")
+ocGradient.Color = ColorSequence.new(Color3.fromRGB(14, 26, 42), Color3.fromRGB(44, 78, 104))
+ocGradient.Rotation = 90
+ocGradient.Parent = ocean
+local ocStroke = Instance.new("UIStroke")
+ocStroke.Color = Color3.fromRGB(72, 108, 140)
+ocStroke.Thickness = 3
+ocStroke.Parent = ocean
+
+-- grid lines (parallels + meridians) + atlas labels
+for i = 1, 5 do
+	local line = Instance.new("Frame")
+	line.Name = "Meridian_" .. i
+	line.BackgroundColor3 = Color3.new(1, 1, 1)
+	line.BackgroundTransparency = 0.9
+	line.BorderSizePixel = 0
+	line.Size = UDim2.new(0, 1, 1, 0)
+	line.Position = UDim2.new(i / 6, 0, 0, 0)
+	line.ZIndex = 35
+	line.Parent = ocean
+end
+for i = 1, 3 do
+	local line = Instance.new("Frame")
+	line.Name = "Parallel_" .. i
+	line.BackgroundColor3 = Color3.new(1, 1, 1)
+	line.BackgroundTransparency = 0.9
+	line.BorderSizePixel = 0
+	line.Size = UDim2.new(1, 0, 0, 1)
+	line.Position = UDim2.new(0, 0, i / 4, 0)
+	line.ZIndex = 35
+	line.Parent = ocean
+end
+local letters = { "A", "B", "C", "D", "E", "F" }
+for i, l in ipairs(letters) do
+	local lbl = Instance.new("TextLabel")
+	lbl.Name = "GridCol_" .. l
+	lbl.BackgroundTransparency = 1
+	lbl.Size = UDim2.new(1 / 6, 0, 0, 16)
+	lbl.Position = UDim2.new((i - 1) / 6, 0, -0.055, 0)
+	lbl.Font = Enum.Font.Bangers
+	lbl.Text = l
+	lbl.TextColor3 = Color3.fromRGB(150, 185, 220)
+	lbl.TextTransparency = 0.25
+	lbl.TextScaled = true
+	lbl.ZIndex = 35
+	lbl.Parent = ocean
+end
+for r = 1, 4 do
+	local lbl = Instance.new("TextLabel")
+	lbl.Name = "GridRow_" .. r
+	lbl.BackgroundTransparency = 1
+	lbl.Size = UDim2.new(0.045, 0, 0.2, 0)
+	lbl.Position = UDim2.new(0.006, 0, (r - 1) / 4 + 0.02, 0)
+	lbl.Font = Enum.Font.Bangers
+	lbl.Text = tostring(r)
+	lbl.TextColor3 = Color3.fromRGB(150, 185, 220)
+	lbl.TextTransparency = 0.25
+	lbl.TextScaled = true
+	lbl.ZIndex = 35
+	lbl.Parent = ocean
+end
+
+-- continent blobs per zone (organic clusters, atlas look)
+local bossMarks: { [string]: TextLabel } = {}
+for _, zone in ipairs(MAP_ZONES) do
+	local zx = zone.minX / WORLD_SPAN
+	local zw = (zone.maxX - zone.minX) / WORLD_SPAN
+	local function blob(sx: number, sy: number, px: number, py: number, grow: number)
+		local b = Instance.new("Frame")
+		b.BackgroundColor3 = zone.color
+		b.BorderSizePixel = 0
+		b.Size = UDim2.new(zw * sx, 0, sy, 0)
+		b.Position = UDim2.new(zx + zw * px, 0, py, 0)
+		b.ZIndex = 36
+		b.Parent = ocean
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 26)
+		c.Parent = b
+		return b
+	end
+	blob(0.6, 0.34, 0.02, 0.18, 0)   -- upper-left mass
+	blob(1.0, 0.34, 0.0, 0.32, 0)    -- main body
+	blob(0.66, 0.28, 0.3, 0.52, 0)   -- lower-right mass
+
+	local name = Instance.new("TextLabel")
+	name.Name = "Name_" .. zone.key
+	name.BackgroundTransparency = 1
+	name.Size = UDim2.new(zw, 0, 0.12, 0)
+	name.Position = UDim2.new(zx, 0, 0.33, 0)
+	name.Font = Enum.Font.Bangers
+	name.Text = zone.name
+	name.TextColor3 = Color3.new(1, 1, 1)
+	name.TextTransparency = 0.12
+	name.TextStrokeTransparency = 0.65
+	name.TextScaled = true
+	name.ZIndex = 37
+	name.Parent = ocean
+end
+
+-- boss markers (x by boss, greyed when felled)
+local bossRowY = 0.52
+for _, boss in ipairs(MAP_BOSSES) do
+	local holder = Instance.new("Frame")
+	holder.Name = "Boss_" .. boss.kind
+	holder.BackgroundTransparency = 1
+	holder.Size = UDim2.new(0.05, 0, 0.22, 0)
+	holder.Position = UDim2.new(boss.x / WORLD_SPAN - 0.025, 0, bossRowY - 0.07, 0)
+	holder.ZIndex = 38
+	holder.Parent = ocean
+	local mark = Instance.new("TextLabel")
+	mark.Name = "Mark"
+	mark.BackgroundTransparency = 1
+	mark.Size = UDim2.new(1, 0, 0.6, 0)
+	mark.Position = UDim2.new(0, 0, 0, 0)
+	mark.Font = Enum.Font.Bangers
+	mark.Text = "×"
+	mark.TextScaled = true
+	mark.TextColor3 = Color3.fromRGB(255, 90, 90)
+	mark.ZIndex = 38
+	mark.Parent = holder
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0.4, 0)
+	label.Position = UDim2.new(0, 0, 0.55, 0)
+	label.Font = Enum.Font.Bangers
+	label.Text = "BOSS"
+	label.TextColor3 = Color3.fromRGB(255, 110, 110)
+	label.TextScaled = true
+	label.ZIndex = 38
+	label.Parent = holder
+	bossMarks[boss.kind] = mark
+end
+
+-- "YOU" marker
+youMarker = Instance.new("TextLabel")
+youMarker.Name = "YouMarker"
+youMarker.BackgroundTransparency = 1
+youMarker.Size = UDim2.new(0.05, 0, 0.16, 0)
+youMarker.Position = UDim2.new(30 / WORLD_SPAN - 0.025, 0, 0.55, 0)
+youMarker.Font = Enum.Font.Bangers
+youMarker.Text = "▲"
+youMarker.TextScaled = true
+youMarker.TextColor3 = Color3.fromRGB(255, 235, 110)
+youMarker.TextStrokeTransparency = 0.3
+youMarker.ZIndex = 39
+youMarker.Parent = ocean
+local youLabel = Instance.new("TextLabel")
+youLabel.Name = "YouLabel"
+youLabel.BackgroundTransparency = 1
+youLabel.Size = UDim2.new(0.07, 0, 0.1, 0)
+youLabel.Position = UDim2.new(30 / WORLD_SPAN - 0.035, 0, 0.75, 0)
+youLabel.Font = Enum.Font.Bangers
+youLabel.Text = "YOU"
+youLabel.TextColor3 = Color3.fromRGB(255, 235, 110)
+youLabel.TextTransparency = 0.15
+youLabel.TextScaled = true
+youLabel.ZIndex = 39
+youLabel.Parent = ocean
+
+-- compass
+local compass = Instance.new("Frame")
+compass.Name = "Compass"
+compass.Size = UDim2.new(0.075, 0, 0.24, 0)
+compass.Position = UDim2.new(0.905, 0, 0.05, 0)
+compass.BackgroundColor3 = Color3.fromRGB(10, 24, 38)
+compass.BackgroundTransparency = 0.15
+compass.BorderSizePixel = 0
+compass.ZIndex = 38
+compass.Parent = ocean
+local cc = Instance.new("UICorner")
+cc.CornerRadius = UDim.new(1, 0)
+cc.Parent = compass
+local cs = Instance.new("UIStroke")
+cs.Color = Color3.fromRGB(150, 190, 230)
+cs.Thickness = 1.5
+cs.Parent = compass
+local compassN = Instance.new("TextLabel")
+compassN.Name = "North"
+compassN.BackgroundTransparency = 1
+compassN.Size = UDim2.new(1, 0, 0.55, 0)
+compassN.Position = UDim2.new(0, 0, 0.06, 0)
+compassN.Font = Enum.Font.Bangers
+compassN.Text = "N"
+compassN.TextColor3 = Color3.fromRGB(190, 255, 190)
+compassN.TextScaled = true
+compassN.ZIndex = 39
+compassN.Parent = compass
+
+-- footer: legend + world-progress bar
+local legend = Instance.new("TextLabel")
+legend.Name = "Legend"
+legend.BackgroundTransparency = 1
+legend.Size = UDim2.new(0.46, 0, 0, 14)
+legend.Position = UDim2.new(0, 6, 1, -18)
+legend.Font = Enum.Font.Gotham
+legend.Text = "▲ YOU    × GUARDIAN    ✦ MEMORY"
+legend.TextColor3 = Color3.fromRGB(150, 190, 220)
+legend.TextScaled = true
+legend.TextXAlignment = Enum.TextXAlignment.Left
+legend.ZIndex = 38
+legend.Parent = mapBox
+
+local progressCaption = Instance.new("TextLabel")
+progressCaption.Name = "ProgressCaption"
+progressCaption.BackgroundTransparency = 1
+progressCaption.Size = UDim2.new(0.46, 0, 0, 12)
+progressCaption.Position = UDim2.new(0.5, 0, 1, -18)
+progressCaption.Font = Enum.Font.Gotham
+progressCaption.Text = "GUARDIANS FELLED 0/6"
+progressCaption.TextColor3 = Color3.fromRGB(150, 190, 220)
+progressCaption.TextScaled = true
+progressCaption.TextXAlignment = Enum.TextXAlignment.Right
+progressCaption.ZIndex = 38
+progressCaption.Parent = mapBox
+
+local progressBack = Instance.new("Frame")
+progressBack.Name = "Progress"
+progressBack.Size = UDim2.new(0.5, 0, 0, 8)
+progressBack.Position = UDim2.new(0.5, 0, 1, -30)
+progressBack.BackgroundColor3 = Color3.fromRGB(30, 40, 56)
+progressBack.BorderSizePixel = 0
+progressBack.ZIndex = 38
+progressBack.Parent = mapBox
+local pbc2 = Instance.new("UICorner")
+pbc2.CornerRadius = UDim.new(0, 4)
+pbc2.Parent = progressBack
+local progressFill = Instance.new("Frame")
+progressFill.Name = "Fill"
+progressFill.Size = UDim2.new(0, 0, 1, 0)
+progressFill.BackgroundColor3 = Color3.fromRGB(255, 215, 120)
+progressFill.BorderSizePixel = 0
+progressFill.ZIndex = 39
+progressFill.Parent = progressBack
+local pfc = Instance.new("UICorner")
+pfc.CornerRadius = UDim.new(0, 4)
+pfc.Parent = progressFill
+
+local mapClose = Instance.new("TextButton")
+mapClose.Name = "CloseMap"
+mapClose.BackgroundColor3 = Color3.fromRGB(55, 32, 32)
+mapClose.BorderSizePixel = 0
+mapClose.Size = UDim2.new(0, 34, 0, 34)
+mapClose.Position = UDim2.new(1, -42, 0, 8)
+mapClose.Font = Enum.Font.Bangers
+mapClose.Text = "X"
+mapClose.TextColor3 = Color3.fromRGB(255, 200, 200)
+mapClose.TextScaled = true
+mapClose.ZIndex = 40
+mapClose.Parent = mapBox
+local mcc = Instance.new("UICorner")
+mcc.CornerRadius = UDim.new(0, 8)
+mcc.Parent = mapClose
+
+local function refreshMap()
+	local payload = gui:GetAttribute("LastPayload") :: any?
+	local defeated = (payload and payload.bossesDefeated) or {}
+	local pages = payload and payload.pages or {}
+	for _, boss in ipairs(MAP_BOSSES) do
+		local mark = bossMarks[boss.kind]
+		if mark then
+			mark.TextColor3 = if defeated[boss.kind] then Color3.fromRGB(120, 210, 130) else Color3.fromRGB(255, 90, 90)
+		end
+	end
+	local felled = 0
+	for _, boss in ipairs(MAP_BOSSES) do
+		if defeated[boss.kind] then
+			felled += 1
+		end
+	end
+	progressFill.Size = UDim2.new(felled / 6, 0, 1, 0)
+	progressCaption.Text = "GUARDIANS FELLED " .. felled .. "/6"
+	local found = 0
+	for _ in pairs(pages) do
+		found += 1
+	end
+	legend.Text = "▲ YOU    × GUARDIAN    ✦ MEMORY " .. found .. "/8"
+end
+
+local lastMapHeartbeat = 0
+local function toggleMap(force: boolean?)
+	mapOpen = if force ~= nil then force else not mapOpen
+	mapPanel.Visible = mapOpen
+	if mapOpen then
+		refreshMap()
+	end
+end
+
+mapClose.Activated:Connect(function()
+	toggleMap(false)
+end)
+
+RunService.Heartbeat:Connect(function()
+	if not mapOpen then
+		return
+	end
+	if tick() - lastMapHeartbeat < 0.4 then
+		return
+	end
+	lastMapHeartbeat = tick()
+	local fraction = math.clamp(((hrp and hrp.Position.X) or 30) / WORLD_SPAN, 0, 1)
+	youMarker.Position = UDim2.new(fraction - 0.025, 0, 0.55, 0)
+	youLabel.Position = UDim2.new(fraction - 0.035, 0, 0.72, 0)
+end)
+
+local mapBtn = makeHudButton("MapBtn", "MAP", UDim2.new(1, -330, 0, 44), function()
+	toggleMap()
+end)
+
 -- —————— input ——————
 
 local function castAbility(abilityId: string)
@@ -451,7 +1069,7 @@ local function castAbility(abilityId: string)
 	end
 	castLockUntil = tick() + 0.45
 	local aim = mouse.Hit
-	RE.cast:FireServer(abilityId, aim.X, aim.Y)
+	RE.cast:FireServer(abilityId, aim.Position)
 	-- local cooldown visual
 	if cd then
 		cd.Visible = true
@@ -477,9 +1095,17 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	end
 	-- pause toggle
 	if input.KeyCode == Enum.KeyCode.Escape then
+		if mapOpen then
+			toggleMap(false)
+			return
+		end
 		if not titleOpen then
 			togglePause()
 		end
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.M then
+		toggleMap()
 		return
 	end
 	for i, kc in ipairs(hotkeys) do
@@ -497,6 +1123,11 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 			doInteract()
 		end
 	end
+	if input.KeyCode == Enum.KeyCode.Q then
+		if not paused and not titleOpen then
+			RE.awaken:FireServer()
+		end
+	end
 	if input.KeyCode == Enum.KeyCode.Space then
 		if not paused and not titleOpen then
 			requestJump()
@@ -511,9 +1142,14 @@ function swingAttack()
 		return
 	end
 	attackAnimating = true
-	local dir = facing
+	local look = camera.CFrame.LookVector
+	local dir = Vector3.new(look.X, 0, look.Z)
+	if dir.Magnitude < 0.01 then
+		dir = Vector3.new(1, 0, 0)
+	end
+	dir = dir.Unit
 	RE.swing:FireServer(dir)
-	local origin = hrp.Position + Vector3.new(dir * 2, 1.4, 0)
+	local origin = hrp.Position + dir * 2 + Vector3.new(0, 1.4, 0)
 	Effects.swing(origin, dir, false)
 	Effects.shakeCamera(0.07, 0.1)
 	playSfx("SwordSlash", origin, 0.7)
@@ -540,7 +1176,7 @@ function requestJump()
 	else
 		playSfx("Jump", hrp.Position, 0.7)
 	end
-	hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, jumpPower, 0)
+	hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, jumpPower, hrp.AssemblyLinearVelocity.Z)
 	grounded = false
 end
 
@@ -613,58 +1249,35 @@ local function setupCharacter(char: Model)
 	hum = char:WaitForChild("Humanoid") :: Humanoid
 	hum.WalkSpeed = Config.PLAYER.baseSpeed
 	hum.JumpPower = Config.PLAYER.jumpPower
+	hum.AutoRotate = true
+	-- we drive jumping ourselves (double jump / wind bonus) — disable the default
+	hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 	hrp.CFrame = CFrame.new(30, 4, 0)
 
-	-- side-scroll Z lock
+	-- full 3D: default Roblox third-person camera (mouse orbit / wheel zoom)
+	camera.CameraType = Enum.CameraType.Custom
+	camera.CameraSubject = hum
+	camera.CameraMaxZoomDistance = 18
+	camera.CameraMinZoomDistance = 4
+
+	-- kill-Y check only — the Z axis is free in 3D
 	local conn
 	conn = RunService.Heartbeat:Connect(function()
 		if not char.Parent then
 			conn:Disconnect()
 			return
 		end
-		local pos = hrp.Position
-		if math.abs(pos.Z) > 0.5 then
-			hrp.CFrame = CFrame.new(pos.X, pos.Y, 0)
-		end
-		local vel = hrp.AssemblyLinearVelocity
-		hrp.AssemblyLinearVelocity = Vector3.new(vel.X, vel.Y, 0)
-		if pos.Y < Config.WORLD.killY then
+		if hrp.Position.Y < Config.WORLD.killY then
 			RE.respawn:FireServer()
 		end
 	end)
 
-	-- movement + flip + camera
-	RunService.Heartbeat:Connect(function(dt)
+	-- grounded detection, coyote time, wind glide
+	-- (locomotion itself is handled by the default controller — WASD / touch stick)
+	RunService.Heartbeat:Connect(function(_dt)
 		if not hrp or paused or titleOpen then
 			return
 		end
-		local move = moveDir
-		if UserInputService:IsKeyDown(Enum.KeyCode.A) then
-			move -= 1
-		end
-		if UserInputService:IsKeyDown(Enum.KeyCode.D) then
-			move += 1
-		end
-		if move ~= 0 then
-			facing = move
-		end
-		for _, d in ipairs(char:GetDescendants()) do
-			if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" then
-				local sx = math.abs(d.Size.X)
-				if d.Size.X * facing < 0 then
-					d.Size = Vector3.new(sx * facing, d.Size.Y, d.Size.Z)
-				end
-			end
-		end
-		local speed = Config.PLAYER.baseSpeed
-		local payload = gui:GetAttribute("LastPayload") :: any?
-		if payload and payload.abilities and payload.abilities.wind then
-			speed += Config.PLAYER.windSpeedBonus
-		end
-		local targetVel = Vector3.new(move * speed, hrp.AssemblyLinearVelocity.Y, 0)
-		hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity:Lerp(targetVel, 1 - math.exp(-16 * dt))
-
-		-- ground / coyote / wind glide
 		local origin = hrp.Position + Vector3.new(0, 1, 0)
 		local result = workspace:Raycast(origin, Vector3.new(0, -hrp.Size.Y / 2 - 0.4, 0))
 		if result then
@@ -689,18 +1302,26 @@ local function setupCharacter(char: Model)
 		else
 			grounded = false
 		end
+		local payload = gui:GetAttribute("LastPayload") :: any?
 		if payload and payload.abilities and payload.abilities.wind and not grounded then
 			local vel = hrp.AssemblyLinearVelocity
 			if vel.Y < 0 then
 				hrp.AssemblyLinearVelocity = vel * Vector3.new(1, Config.PLAYER.windGlideFactor, 1)
 			end
 		end
-		-- camera follow
-		local targetCam = CFrame.new(hrp.Position.X, hrp.Position.Y, Config.WORLD.camDepth)
-		camera.CFrame = camera.CFrame:Lerp(targetCam, 1 - math.exp(-9 * dt))
-		local cx = math.clamp(hrp.Position.X, Config.WORLD.minX + 6, Config.WORLD.maxX - 6)
-		if math.abs(camera.CFrame.Position.X - cx) > 2 then
-			camera.CFrame = CFrame.new(cx, camera.CFrame.Position.Y, Config.WORLD.camDepth)
+	end)
+
+	-- time of day: the realm keeps the player's clock
+	local nowT = os.date("*t")
+	RE.syncTime:FireServer(nowT.hour + nowT.min / 60)
+	task.spawn(function()
+		while true do
+			task.wait(60)
+			if not char.Parent then
+				return
+			end
+			local tt = os.date("*t")
+			RE.syncTime:FireServer(tt.hour + tt.min / 60)
 		end
 	end)
 end

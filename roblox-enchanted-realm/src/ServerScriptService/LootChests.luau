@@ -116,7 +116,7 @@ function LootChests.init(RE)
 			end
 
 			if spec.ink then
-				s.ink = math.min(Config.INK.max, s.ink + spec.ink)
+				s.ink = math.min(Session.maxInk(s), s.ink + spec.ink)
 				s.dirty = true
 				RE.dialogue:FireClient(player, "loot", "Old ink, still usable — +" .. spec.ink .. " ink.")
 			end

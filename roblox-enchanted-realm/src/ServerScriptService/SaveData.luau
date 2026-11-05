@@ -29,6 +29,10 @@ function SaveData.defaultSave()
 		portalUnlocked = false,
 		machineAwake = false,
 		playtimeSeconds = 0,
+		maxInkBonus = 0, -- satchels
+		roles = {}, -- [styleKey] = rank
+		jobs = {}, -- [jobKey] = rank
+		foundPages = {}, -- [pageId] = true
 	}
 end
 

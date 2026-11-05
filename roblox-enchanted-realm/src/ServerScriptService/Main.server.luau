@@ -17,6 +17,7 @@ local LootChests = require(script.Parent:WaitForChild("LootChests"))
 local AdminCommands = require(script.Parent:WaitForChild("AdminCommands"))
 local Tutorial = require(script.Parent:WaitForChild("Tutorial"))
 local Merchant = require(script.Parent:WaitForChild("Merchant"))
+local Pages = require(script.Parent:WaitForChild("Pages"))
 
 -- ————————————————————— remotes ——————————————————————
 local remotes = Instance.new("Folder")
@@ -54,12 +55,65 @@ local RE = {
 	ZoneEnter = newEvent("ZoneEnter"),
 	dialogue = newEvent("Dialogue"),
 	narrator = newEvent("Narrator"),
+	buy = newEvent("BuyItem"),
+	awaken = newEvent("Awaken"),
+	syncTime = newEvent("SyncTime"),
 }
 
 local objectiveText = Instance.new("StringValue")
 objectiveText.Name = "ObjectiveText"
 objectiveText.Value = Config.OBJECTIVES.start
 objectiveText.Parent = remotes
+
+-- ————————————————————— time of day (syncs to the player's clock) ——————————————————————
+-- The client reports its local wall-clock hour; the server restyles the
+-- whole world to match — dawn, day, dusk or deep night like the player's PC.
+local function applyTimeOfDay(hourFloat: number)
+	local L = game:GetService("Lighting")
+	L.ClockTime = hourFloat
+	-- rough "day-ness" curve: peaks at noon, zero at midnight
+	local day = math.max(0, math.sin((hourFloat - 6) * math.pi / 12))
+	L.Brightness = 0.35 + 2.1 * day
+	L.Ambient = Color3.fromRGB(
+		math.floor(26 + 60 * day),
+		math.floor(30 + 55 * day),
+		math.floor(44 + 48 * day)
+	)
+	L.OutdoorAmbient = Color3.fromRGB(
+		math.floor(40 + 95 * day),
+		math.floor(46 + 86 * day),
+		math.floor(58 + 74 * day)
+	)
+	L.FogEnd = if day < 0.15 then 350 else 1200
+end
+
+local function timeWord(hour: number): string
+	if hour >= 5 and hour < 7 then return "dawn"
+	elseif hour >= 7 and hour < 11 then return "morning"
+	elseif hour >= 11 and hour < 14 then return "midday"
+	elseif hour >= 14 and hour < 17 then return "afternoon"
+	elseif hour >= 17 and hour < 19 then return "dusk"
+	elseif hour >= 19 and hour < 23 then return "night"
+	else
+		return "deep night"
+	end
+end
+
+local timeSynced = false
+
+RE.syncTime.OnServerEvent:Connect(function(player, hourFloat)
+	if typeof(hourFloat) ~= "number" then
+		return
+	end
+	hourFloat = hourFloat % 24
+	local firstSync = not timeSynced
+	timeSynced = true
+	applyTimeOfDay(hourFloat)
+	if firstSync then
+		local word = timeWord(hourFloat)
+		RE.dialogue:FireClient(player, "time", "Mish: The realm keeps your hour — it is " .. word .. " where you stand.")
+	end
+end)
 
 -- push current session payload to the client HUD
 local function pushSync(playerObj: Player)
@@ -217,7 +271,7 @@ end
 
 function respawnPlayer(s: Session.State)
 	Session.recalcHp(s, true)
-	s.ink = math.min(Config.INK.max, s.ink + Config.INK.startInk)
+	s.ink = math.min(Session.maxInk(s), s.ink + Config.INK.startInk)
 	Bosses.resetAll()
 	local char = s.player.Character
 	if char then
@@ -372,15 +426,20 @@ for _, barrier in ipairs(world.barriers) do
 	end)
 end
 
-RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, aimY: number)
+RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aim: Vector3)
 	local s = Session.get(player)
 	if not s then
+		return
+	end
+	if typeof(aim) ~= "Vector3" then
 		return
 	end
 	if not Session.hasAbility(s, abilityId) then
 		return
 	end
-	if not hasInk(s, abilityId) then
+	-- "Over-Inked": cast at a full meter — free, twice as strong, burns the meter
+	local overInked = s.ink >= Session.maxInk(s)
+	if not overInked and not hasInk(s, abilityId) then
 		RE.playSound:FireAllClients("MachineDenied", player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position or Vector3.zero, 0.5)
 		return
 	end
@@ -396,12 +455,28 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		return
 	end
 	local origin = hrp.Position
-	local dir = Vector3.new(aimX - origin.X, aimY - origin.Y, 0)
+	local dir = Vector3.new(aim.X - origin.X, 0, aim.Z - origin.Z)
 	if dir.Magnitude < 0.01 then
 		dir = Vector3.new(1, 0, 0)
 	end
 	dir = dir.Unit
-	spendInk(s, abilityId)
+	-- multipliers: over-inked surge × mage job bonus × awakening × elemental styles
+	local mageMul = 1 + 0.1 * Session.jobRank(s, "mage")
+	local awakenMul = if tick() < (s.awakenUntil or 0) then Config.AWAKEN.damageMul else 1
+	local flameMul = 1 + 0.25 * (((s.save.roles or {}).flame) or 0)
+	local frostMul = 1 + 0.25 * (((s.save.roles or {}).frost) or 0)
+	local stormMul = 1 + 0.25 * (((s.save.roles or {}).storm) or 0)
+	local damageMul = (if overInked then 2 else 1) * mageMul * awakenMul
+	local radiusMul = if overInked then 1.35 else 1
+	local dmg = Session.baseDamage(s) * damageMul
+	if overInked then
+		s.ink = 0
+		s.dirty = true
+		RE.narrator:FireClient(player, "OVER-INKED — power unbound!", 2.5)
+		RE.vfx:FireAllClients("bossBurst", origin, Color3.fromRGB(255, 230, 140))
+	else
+		spendInk(s, abilityId)
+	end
 	pushSync(s.player)
 	RE.playSound:FireAllClients(abilityId == "lightning" and "LightningCast"
 		or abilityId == "fire" and "FireCast"
@@ -444,15 +519,15 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		local coneDir = dir
 		Enemies.forEach(function(c)
 			local d = (c.body.Position - origin).Magnitude
-			if d < 12 then
+			if d < 12 * radiusMul then
 				local to = c.body.Position - origin
 				local flat = Vector3.new(to.X, 0, to.Z)
 				if flat.Magnitude > 0 and flat:Dot(coneDir) > 0.5 * flat.Magnitude then
-					Enemies.damage(c, Session.baseDamage(s), origin, "fire")
+					Enemies.damage(c, dmg * flameMul, origin, "fire")
 				end
 			end
 		end)
-		Bosses.damageInRange(origin, 13, Session.baseDamage(s), "fire")
+		Bosses.damageInRange(origin, 13 * radiusMul, dmg * flameMul, "fire")
 		for _, b in ipairs(world.barriers) do
 			local bt = b:GetAttribute("BarrierType")
 			if (bt == "vine" or bt == "wood") and (origin - b.Position).Magnitude < 13 then
@@ -462,8 +537,8 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		RE.vfx:FireAllClients("fireBreath", origin, dir)
 
 	elseif abilityId == "ice" then
-		Enemies.freezeInRadius(origin, 11, 3.5)
-		Bosses.damageInRange(origin, 11, Session.baseDamage(s), "ice")
+		Enemies.freezeInRadius(origin, 11 * radiusMul, 3.5)
+		Bosses.damageInRange(origin, 11 * radiusMul, dmg * frostMul, "ice")
 		local plat = Instance.new("Part")
 		plat.Name = "IcePlatform"
 		plat.Anchored = true
@@ -497,7 +572,7 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		end
 
 	elseif abilityId == "wind" then
-		hrp.AssemblyLinearVelocity = Vector3.new(dir.X * 52, 28, 0)
+		hrp.AssemblyLinearVelocity = Vector3.new(dir.X * 52, 28, dir.Z * 52)
 		local glide = Instance.new("BoolValue")
 		glide.Name = "WindGlide"
 		glide.Value = true
@@ -505,10 +580,10 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		Debris:AddItem(glide, 2.2)
 
 	elseif abilityId == "powerRock" then
-		Bosses.damageInRange(origin, 14, Session.baseDamage(s) * 2, "rock")
+		Bosses.damageInRange(origin, 14 * radiusMul, dmg * 2, "rock")
 		Enemies.forEach(function(c)
-			if (c.body.Position - origin).Magnitude < 14 then
-				Enemies.damage(c, Session.baseDamage(s) * 2, origin, "rock")
+			if (c.body.Position - origin).Magnitude < 14 * radiusMul then
+				Enemies.damage(c, dmg * 2, origin, "rock")
 			end
 		end)
 		for _, b in ipairs(world.barriers) do
@@ -532,20 +607,19 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 
 	elseif abilityId == "shockwave" then
 		-- nova: damage every enemy/boss around you, small hop for flavor
-		local radius = 16
-		local dmg = Session.baseDamage(s) * 1.5
+		local radius = 16 * radiusMul
 		Enemies.forEach(function(c)
 			if (c.body.Position - origin).Magnitude < radius then
-				Enemies.damage(c, dmg, origin, "physical")
+				Enemies.damage(c, dmg * 1.5 * stormMul, origin, "physical")
 			end
 		end)
-		Bosses.damageInRange(origin, radius, dmg, "physical")
-		hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 26, 0)
+		Bosses.damageInRange(origin, radius, dmg * 1.5 * stormMul, "physical")
+		hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 26, hrp.AssemblyLinearVelocity.Z)
 		RE.vfx:FireAllClients("bossBurst", origin, Color3.fromRGB(150, 215, 255))
 	end
 end)
 
-RE.swing.OnServerEvent:Connect(function(player, dirX: number)
+RE.swing.OnServerEvent:Connect(function(player, dirVec: Vector3)
 	local s = Session.get(player)
 	if not s then
 		return
@@ -555,24 +629,33 @@ RE.swing.OnServerEvent:Connect(function(player, dirX: number)
 	if not hrp then
 		return
 	end
-	local dir = Vector3.new(dirX, 0, 0).Unit
-	local origin = hrp.Position + Vector3.new(dir.X * 3, 1.6, 0)
+	local dir = if typeof(dirVec) == "Vector3" and Vector3.new(dirVec.X, 0, dirVec.Z).Magnitude > 0.01
+		then Vector3.new(dirVec.X, 0, dirVec.Z).Unit
+		else Vector3.new(1, 0, 0)
+	local origin = hrp.Position + dir * 3 + Vector3.new(0, 1.6, 0)
+	local meleeMul = (1 + 0.1 * Session.jobRank(s, "warrior")) * (if tick() < (s.awakenUntil or 0) then Config.AWAKEN.damageMul else 1)
+	local meleeDmg = Session.baseDamage(s) * meleeMul
 	local hitAny = false
 	Enemies.forEach(function(c)
 		local to = c.body.Position - origin
 		local flat = Vector3.new(to.X, 0, to.Z)
-		if flat.Magnitude < Config.PLAYER.attackRange and flat:Dot(dir) > 0.4 then
-			Enemies.damage(c, Session.baseDamage(s), origin, "physical")
+		if flat.Magnitude < Config.PLAYER.attackRange and flat.Magnitude > 0.01 and flat.Unit:Dot(dir) > 0.35 then
+			Enemies.damage(c, meleeDmg, origin, "physical")
 			hitAny = true
 		end
 	end)
-	Bosses.damageInRange(origin, Config.PLAYER.attackRange + 2, Session.baseDamage(s), "physical")
+	Bosses.damageInRange(origin, Config.PLAYER.attackRange + 2, meleeDmg, "physical")
 	if hitAny then
-		s.ink = math.min(Config.INK.max, s.ink + Config.INK.meterGainPerHit)
+		s.ink = math.min(Session.maxInk(s), s.ink + Config.INK.meterGainPerHit)
+		local healRank = Session.jobRank(s, "healer")
+		if healRank > 0 then
+			s.hp = math.min(Session.maxHp(s), s.hp + 3 * healRank)
+		end
 		s.dirty = true
 	end
 	RE.playSound:FireAllClients(hitAny and "SwordHit" or "SwordSlash", origin, 0.7)
 	RE.vfx:FireAllClients("swing", origin, dir, hitAny)
+	pushSync(s.player)
 end)
 
 RE.interact.OnServerEvent:Connect(function(player, targetName: string)
@@ -693,6 +776,145 @@ task.spawn(function()
 	end
 end)
 
+-- skills/shop purchases (the in-game SKILLS panel sends these)
+RE.buy.OnServerEvent:Connect(function(player, itemId: string)
+	local s = Session.get(player)
+	if not s then
+		return
+	end
+	local xp = math.floor(s.save.xp or 0)
+	local level = s.save.level or 1
+	local hearts = math.floor((s.save.maxHpBonus or 0) / Config.PLAYER.heartBonus)
+	local satchels = math.floor((s.save.maxInkBonus or 0) / 25)
+
+	local function ack(msg: string)
+		RE.narrator:FireClient(player, msg, 3)
+		RE.sync:FireClient(player, Session.syncPayload(s))
+	end
+
+	if itemId == "shockwave" then
+		if Session.hasAbility(s, "shockwave") then
+			ack("You already know Shockwave.")
+			return
+		end
+		if xp < 200 then
+			ack("The tome costs 200 XP. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 200
+		s.dirty = true
+		Session.grantAbility(s, "shockwave")
+		RE.vfx:FireAllClients("cast", "shockwave", player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position or Vector3.zero, Vector3.new(1, 0, 0))
+		ack("Tome of Shockwave — press [7]!")
+
+	elseif itemId == "satchel" then
+		if satchels >= 3 then
+			ack("Your satchel is full (3/3).")
+			return
+		end
+		if xp < 150 then
+			ack("Ink Satchel costs 150 XP. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 150
+		s.dirty = true
+		Session.grantSatchel(s)
+		ack("Ink Satchel — +25 max ink. (" .. (satchels + 1) .. "/3)")
+
+	elseif itemId == "heart" then
+		if hearts >= 3 then
+			ack("Your heart can hold no more (3/3).")
+			return
+		end
+		if xp < 150 then
+			ack("Heart Container costs 150 XP. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 150
+		s.dirty = true
+		Session.grantHeart(s)
+		ack("Heart Container — +20 max HP. (" .. (hearts + 1) .. "/3)")
+
+	elseif itemId == "potion" then
+		if xp < 10 then
+			ack("Ink Potion costs 10 XP. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 10
+		s.ink = Session.maxInk(s)
+		s.dirty = true
+		ack("Ink Potion — your meter is full.")
+
+	elseif itemId == "style_flame" or itemId == "style_storm" or itemId == "style_frost" then
+		local key = string.sub(itemId, 7)
+		local def = (Config.STYLES :: any)[key]
+		s.save.roles = s.save.roles or {}
+		local rank = s.save.roles[key] or 0
+		if rank >= 3 then
+			ack(def.name .. " is already mastered.")
+			return
+		end
+		if xp < 150 then
+			ack(def.name .. " costs 150 XP per rank. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 150
+		s.save.roles[key] = rank + 1
+		s.dirty = true
+		ack(def.name .. " — Rank " .. (rank + 1) .. "/3")
+
+	elseif itemId == "job_warrior" or itemId == "job_mage" or itemId == "job_healer" then
+		local key = string.sub(itemId, 5)
+		local def = (Config.JOBS :: any)[key]
+		s.save.jobs = s.save.jobs or {}
+		local rank = s.save.jobs[key] or 0
+		if rank >= 3 then
+			ack(def.name .. " is already mastered.")
+			return
+		end
+		if xp < 150 then
+			ack(def.name .. " costs 150 XP per rank. (you have " .. xp .. ")")
+			return
+		end
+		s.save.xp -= 150
+		s.save.jobs[key] = rank + 1
+		s.dirty = true
+		Session.recalcHp(s, true) -- warrior heart bonus applies immediately
+		ack(def.name .. " — Rank " .. (rank + 1) .. "/3")
+	end
+end)
+
+-- anime Ink Awakening — burns the full meter for 6s of raw fury (Q)
+RE.awaken.OnServerEvent:Connect(function(player)
+	local s = Session.get(player)
+	if not s then
+		return
+	end
+	local maxInk = Session.maxInk(s)
+	if s.ink < maxInk then
+		RE.narrator:FireClient(player, "Ink Awakening needs a full meter.", 3)
+		return
+	end
+	s.ink = 0
+	s.awakenUntil = tick() + Config.AWAKEN.duration
+	s.dirty = true
+	local char = player.Character
+	local hrp2 = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local hum2 = char and char:FindFirstChildOfClass("Humanoid")
+	if hum2 then
+		hum2.WalkSpeed = Config.PLAYER.baseSpeed + Config.AWAKEN.walkSpeedBonus
+		task.delay(Config.AWAKEN.duration, function()
+			if hum2 and hum2.Parent then
+				hum2.WalkSpeed = Config.PLAYER.baseSpeed
+			end
+		end)
+	end
+	RE.narrator:FireClient(player, "INK AWAKENING!!", 3)
+	RE.vfx:FireAllClients("bossBurst", hrp2 and hrp2.Position or Vector3.new(s.checkpointPos.X, 2, 0), Color3.fromRGB(255, 215, 120))
+	RE.playSound:FireAllClients("AbilityUnlock", hrp2 and hrp2.Position or Vector3.new(s.checkpointPos.X, 2, 0), 1)
+	pushSync(s.player)
+end)
+
 RE.respawn.OnServerEvent:Connect(function(player)
 	local s = Session.get(player)
 	if s and s.hp <= 0 then
@@ -756,6 +978,7 @@ end)
 LootChests.init(RE)
 AdminCommands.init(RE)
 Merchant.init(RE)
+Pages.init(RE)
 
 Enemies.setCallbacks(RE, hurtPlayer)
 Enemies.spawnAllFromRegions()

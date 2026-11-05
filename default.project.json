@@ -51,6 +51,9 @@
       },
       "Merchant": {
         "$path": "roblox-enchanted-realm/src/ServerScriptService/Merchant.luau"
+      },
+      "Pages": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/Pages.luau"
       }
     },
     "StarterPlayer": {

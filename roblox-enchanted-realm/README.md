@@ -1,6 +1,6 @@
 # Enchanted Realm: Inkbound — Roblox Metroidvania
 
-A complete, playable 2D side-scrolling Metroidvania built for **Roblox Studio**, ported from the "Enchanted Realm" Game Design Document (Group 5) and given a unique **hand-drawn "Inkbound"** identity.
+A complete, playable 3D third-person Metroidvania built for **Roblox Studio**, ported from the "Enchanted Realm" Game Design Document and given a unique **hand-drawn "Inkbound"** identity.
 
 ## What it is (from the GDD, kept intact)
 - **Genre:** Metroidvania (Hollow Knight / Ori / Blasphemous inspired)
@@ -11,7 +11,12 @@ A complete, playable 2D side-scrolling Metroidvania built for **Roblox Studio**,
 - **XP / leveling, Heart Containers, checkpoint lanterns, death/respawn.**
 
 ## What makes it unique (Inkbound twist)
+- **The world is a sketch:** every object has a matte body with a hand-drawn black ink outline.
 - **Ink meter:** abilities cost Ink; landing melee hits refunds it — a risk/reward combat loop.
+- **Living time:** the realm syncs to the player's local clock — dawn, midday, dusk and deep night roll through with the real-world hour, and the HUD shows local time top-right.
+- **OVER-INKED:** cast while your meter is full and the spell is **free and twice as strong** — the screen bursts open and your meter burns to zero. The whole combat economy revolves around earning it.
+- **Skills & Shop panel:** press **SKILLS** any time to review known/locked abilities and buy gear with XP — Shockwave tome, Heart Containers, Ink Satchels (+25 max ink), Ink Potions.
+- **Merchant Syla & loot chests:** a trader by the spawn, and 12 one-shot chests along the route hiding ink and XP.
 - **Guardian Echoes:** every Guardian you defeat grants a permanent passive (Kidlat = 3rd-hit arcs, Piyedro = stone skin, Peyro = ember cloak, Dan = still waters, Maam Jyr = gale step, Nukos = the tide remembers).
 - **Mish** is an active companion who barks navigation hints and the game's story beats.
 - **Hand-drawn "Inkbound" look:** matte colors + black ink outlines + neon elemental accents + comic-style Bangers UI.
@@ -20,11 +25,13 @@ A complete, playable 2D side-scrolling Metroidvania built for **Roblox Studio**,
 ## Controls
 | Action | Keyboard / Gamepad | Mobile (touch) |
 |---|---|---|
-| Move | A / D | D-pad ◀ ▶ |
-| Jump | Space | ⬆ Jump button |
-| Attack / Swing | Left-click | ⚔ Attack button |
-| Ability 1–6 | 1 2 3 4 5 6 | Ability buttons (bottom center) |
+| Move | **W A S D** / arrow keys | Roblox virtual stick |
+| Jump | Space | Jump button |
+| Attack / Swing | Left-click | Attack button |
+| Ability 1–7 | 1 2 3 4 5 6 7 | Ability buttons (bottom center) |
 | Interact | E | E button |
+| Skills / Shop | SKILLS button (top-right) | SKILLS button (top-right) |
+| Tactical Map | M | MAP button (top-right) |
 
 The HUD auto-detects your device and shows **Desktop / Mobile / Console** with the active input method.
 

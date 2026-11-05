@@ -62,7 +62,7 @@ local function handle(RE, player: Player, text: string)
 		ack("HP restored.")
 
 	elseif cmd == "/ink" then
-		s.ink = Config.INK.max
+		s.ink = Session.maxInk(s)
 		s.dirty = true
 		ack("Ink refilled.")
 

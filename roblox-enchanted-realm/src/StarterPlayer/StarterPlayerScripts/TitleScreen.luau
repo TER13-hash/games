@@ -128,7 +128,7 @@ credits.BackgroundTransparency = 1
 credits.Size = UDim2.new(0, 500, 0, 30)
 credits.Position = UDim2.new(0.5, -250, 1, -40)
 credits.Font = Enum.Font.Gotham
-credits.Text = "Group 5 · Enchanted Realm GDD · Roblox Edition"
+credits.Text = "Enchanted Realm: Inkbound · Roblox Edition"
 credits.TextColor3 = Color3.fromRGB(120, 120, 130)
 credits.TextScaled = true
 credits.ZIndex = 102
@@ -168,13 +168,7 @@ function TitleScreen.showCredits()
 	local lines = {
 		"ENCHANTED REALM: INKBOUND",
 		"",
-		"Based on the Game Design Document by Group 5:",
-		"Dyanne Francine Dagsil",
-		"Dann Miguel Cabang",
-		"Aaron Ross Guldo",
-		"Lyka Mata",
-		"Clarke Jedrex Tadeja",
-		"Jasmine Dylan Santos",
+		"A Roblox original.",
 		"",
 		"Inspired by Hollow Knight,",
 		"Ori and the Will of the Wisps,",
@@ -182,8 +176,9 @@ function TitleScreen.showCredits()
 		"",
 		"Hand-drawn 'Inkbound' art style.",
 		"",
-		"Press E to interact · 1-6 for abilities",
-		"Space to jump · Click to attack",
+		"WASD to move · E to interact",
+		"Click to attack · Space to jump",
+		"1-7 for abilities · SKILLS for shop",
 		"",
 		"Good luck, Warrior.",
 	}

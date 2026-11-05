@@ -351,17 +351,16 @@ local function tick(dt: number)
 		local def = c.def
 		local toPlayer = hrp and (hrp.Position - body.Position) or Vector3.zero
 		local distXZ = Vector3.new(toPlayer.X, 0, toPlayer.Z).Magnitude
+		local flat = Vector3.new(toPlayer.X, 0, toPlayer.Z)
+		local flatMag = flat.Magnitude
 
 		if def.flying then
 			-- sine-wave flight, aggro = swoop at the player
 			local bobY = math.sin(now * 2.4 + c.id) * 1.4
 			local targetY = (hrp and (hrp.Position.Y + 3.2) or c.homeY) + bobY
 			if distXZ < 26 and hrp then
-				local dir = Vector3.new(toPlayer.X, 0, 0)
-				if dir.Magnitude > 0.01 then
-					dir = dir.Unit
-				end
-				body.AssemblyLinearVelocity = Vector3.new(dir.X * def.speed, (targetY - body.Position.Y) * 3, 0)
+				local dir = flatMag > 0.01 and flat.Unit or Vector3.new(1, 0, 0)
+				body.AssemblyLinearVelocity = Vector3.new(dir.X * def.speed, (targetY - body.Position.Y) * 3, dir.Z * def.speed)
 			else
 				body.AssemblyLinearVelocity = Vector3.new(c.patrolDir * def.speed * 0.6, (targetY - body.Position.Y) * 3, 0)
 				if math.abs(body.Position.X - c.homeX) > 24 then
@@ -378,21 +377,21 @@ local function tick(dt: number)
 		elsif def.ranged then
 			-- cinderfrog: keep mid distance, spit fireballs
 			local wantDist = 11
-			local move = 0
-			if hrp then
+			local move3 = Vector3.zero
+			if hrp and flatMag > 0.01 then
+				local f = flat.Unit
 				if distXZ > wantDist + 3 then
-					move = if toPlayer.X >= 0 then 1 else -1
+					move3 = f
 				elseif distXZ < wantDist - 3 then
-					move = if toPlayer.X >= 0 then -1 else 1
+					move3 = -f
 				end
-			end
-			if not hrp then
-				move = c.patrolDir
+			else
+				move3 = Vector3.new(c.patrolDir, 0, 0)
 				if math.abs(body.Position.X - c.homeX) > 12 then
 					c.patrolDir *= -1
 				end
 			end
-			body.AssemblyLinearVelocity = Vector3.new(move * def.speed, vel.Y, 0)
+			body.AssemblyLinearVelocity = Vector3.new(move3.X * def.speed, vel.Y, move3.Z * def.speed)
 			-- fireball
 			if hrp and distXZ < 24 and now >= c.attackCooldown then
 				c.attackCooldown = now + 2.3
@@ -400,26 +399,25 @@ local function tick(dt: number)
 			end
 		else
 			-- melee creeps
-			local move = 0
-			if hrp and distXZ < 15 then
-				move = if toPlayer.X >= 0 then 1 else -1
+			local move3 = Vector3.new(c.patrolDir, 0, 0)
+			if hrp and distXZ < 15 and flatMag > 0.01 then
+				move3 = flat.Unit
 			else
-				move = c.patrolDir
 				if math.abs(body.Position.X - c.homeX) > 14 then
 					c.patrolDir *= -1
 				end
 			end
-			body.AssemblyLinearVelocity = Vector3.new(move * def.speed, vel.Y, 0)
+			body.AssemblyLinearVelocity = Vector3.new(move3.X * def.speed, vel.Y, move3.Z * def.speed)
 			if hrp and distXZ < 3.6 and now >= c.attackCooldown then
 				c.attackCooldown = now + 1.6
-				local dir = Vector3.new(if toPlayer.X >= 0 then 1 else -1, 0, 0)
+				local dir = flatMag > 0.01 and flat.Unit or Vector3.new(1, 0, 0)
 				local hrpVel = Vector3.zero
 				if hrp.Parent then
 					local bv = hrp:FindFirstChildOfClass("BodyVelocity")
 					hrpVel = bv and bv.Velocity or Vector3.zero
 				end
 				-- knock the player back a bit
-				hrp.AssemblyLinearVelocity = Vector3.new(dir.X * 26, 12, 0)
+				hrp.AssemblyLinearVelocity = Vector3.new(dir.X * 26, 12, dir.Z * 26)
 				if onPlayerDamaged then
 					onPlayerDamaged(def.damage, body.Position, def.name)
 				end

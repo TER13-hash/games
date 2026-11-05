@@ -102,6 +102,7 @@ function Merchant.init(RE)
 		end
 		local xp = math.floor(s.save.xp or 0)
 		local hatCount = math.floor((s.save.maxHpBonus or 0) / Config.PLAYER.heartBonus)
+		local satchelCount = math.floor((s.save.maxInkBonus or 0) / 25)
 		local function sync()
 			RE.sync:FireClient(player, Session.syncPayload(s))
 		end
@@ -122,9 +123,17 @@ function Merchant.init(RE)
 			RE.playSound:FireAllClients("Checkpoint", torso.Position, 0.8)
 			sync()
 
+		elseif satchelCount < 3 and xp >= 150 then
+			s.save.xp -= 150
+			s.dirty = true
+			Session.grantSatchel(s)
+			RE.narrator:FireClient(player, "Ink Satchel — +25 max ink. (" .. (satchelCount + 1) .. "/3)", 5)
+			RE.playSound:FireAllClients("Checkpoint", torso.Position, 0.8)
+			sync()
+
 		elseif xp >= 10 then
 			s.save.xp -= 10
-			s.ink = Config.INK.max
+			s.ink = Session.maxInk(s)
 			s.dirty = true
 			RE.narrator:FireClient(player, "Ink Potion — your meter is full.", 4)
 			RE.playSound:FireAllClients("Checkpoint", torso.Position, 0.8)

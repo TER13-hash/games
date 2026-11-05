@@ -1,6 +1,6 @@
 --!strict
 -- Enchanted Realm — shared configuration & static tables
--- Metroidvania design ported from the Enchanted Realm GDD (Group 5).
+-- Metroidvania design ported from the Enchanted Realm GDD.
 
 local Config = {}
 
@@ -8,14 +8,13 @@ Config.GAME = {
 	title = "Enchanted Realm: Inkbound",
 	shortTitle = "Inkbound",
 	tagline = "The world is a sketch. Fight for the page.",
-	credits = "Group 5 — Enchanted Realm GDD · Roblox edition",
+	credits = "Enchanted Realm: Inkbound · Roblox Edition",
 }
 
 Config.WORLD = {
 	minX = -40,
 	maxX = 2680,
 	killY = -70,
-	camDepth = 34,
 	nightSky = Color3.fromRGB(24, 34, 44),
 }
 
@@ -180,6 +179,28 @@ Config.BOSSES = {
 		name = "Nukos — the Squid Monster", title = "Owner of the Grand Key",
 		hp = 620, damage = 22, xp = 500, color = Color3.fromRGB(150, 40, 60),
 	},
+}
+
+-- ═══ ANIME POWERS ═══
+-- Ink Awakening: fill the meter, press Q — 6s of pure anime transformation.
+-- Style paths: ranked elemental powers bought in the SKILLS panel (150 XP each).
+-- Jobs: JRPG-style classes with their own passives (150 XP each).
+Config.AWAKEN = {
+	duration = 6,
+	damageMul = 1.75,
+	walkSpeedBonus = 6,
+}
+
+Config.STYLES = {
+	flame = { id = "flame", name = "Flame Style", icon = "🔥", color = Color3.fromRGB(255, 140, 60), desc = "+25% fire damage per rank (max 3)." },
+	storm = { id = "storm", name = "Storm Style", icon = "⚡", color = Color3.fromRGB(150, 215, 255), desc = "+25% shockwave damage per rank (max 3)." },
+	frost = { id = "frost", name = "Frost Style", icon = "❄", color = Color3.fromRGB(170, 230, 255), desc = "+25% ice damage per rank (max 3)." },
+}
+
+Config.JOBS = {
+	warrior = { id = "warrior", name = "Warrior", title = "Vanguard of the Page", icon = "⚔", color = Color3.fromRGB(255, 170, 120), desc = "+15 max HP & +10% melee damage per rank (max 3)." },
+	mage = { id = "mage", name = "Mage", title = "Stormweaver", icon = "✦", color = Color3.fromRGB(180, 140, 255), desc = "+20 max ink & +10% ability damage per rank (max 3)." },
+	healer = { id = "healer", name = "Healer", title = "Luminary of Dawn", icon = "✚", color = Color3.fromRGB(255, 230, 150), desc = "+10% XP per rank. Land melees to mend +3 HP per rank." },
 }
 
 return Config

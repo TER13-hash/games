@@ -20,6 +20,7 @@ export type State = {
 	burnUntil: number,
 	burnAccum: number,
 	rootUntil: number,
+	awakenUntil: number,
 	lastCheckpointId: string,
 	checkpointPos: Vector3,
 	deaths: number,
@@ -42,6 +43,7 @@ function Session.fresh(player: Player): State
 		burnUntil = 0,
 		burnAccum = 0,
 		rootUntil = 0,
+		awakenUntil = 0,
 		lastCheckpointId = save.checkpointId or "cp_start",
 		checkpointPos = Vector3.new(save.checkpointX or 30, 2, 0),
 		deaths = save.deaths or 0,
@@ -64,10 +66,16 @@ function Session.all(): { State }
 	return out
 end
 
+function Session.jobRank(s: State, job: string): number
+	s.save.jobs = s.save.jobs or {}
+	return s.save.jobs[job] or 0
+end
+
 function Session.maxHp(s: State): number
 	return Config.PLAYER.baseHealth
 		+ Config.PLAYER.levelHealthBonus * (s.save.level - 1)
 		+ (s.save.maxHpBonus or 0)
+		+ 15 * Session.jobRank(s, "warrior")
 end
 
 function Session.baseDamage(s: State): number
@@ -111,8 +119,21 @@ function Session.grantHeart(s: State)
 	s.dirty = true
 end
 
+function Session.grantSatchel(s: State)
+	s.save.maxInkBonus = (s.save.maxInkBonus or 0) + 25
+	s.dirty = true
+end
+
+function Session.maxInk(s: State): number
+	return Config.INK.max + (s.save.maxInkBonus or 0) + 20 * Session.jobRank(s, "mage")
+end
+
 function Session.addXp(s: State, amount: number): boolean -- returns true if leveled up
 	local leveled = false
+	local rank = Session.jobRank(s, "healer")
+	if rank > 0 then
+		amount = math.floor(amount * (1 + 0.1 * rank) + 0.5)
+	end
 	s.save.xp = (s.save.xp or 0) + amount
 	while (s.save.level or 1) < Config.PLAYER.maxLevel and s.save.xp >= Config.xpToNext(s.save.level) do
 		s.save.xp -= Config.xpToNext(s.save.level)
@@ -178,12 +199,16 @@ function Session.syncPayload(s: State)
 		hp = math.floor(s.hp),
 		maxHp = Session.maxHp(s),
 		ink = math.floor(s.ink),
-		maxInk = Config.INK.max,
+		maxInk = Session.maxInk(s),
 		xp = math.floor(s.save.xp or 0),
 		xpNext = Config.xpToNext(s.save.level or 1),
 		level = s.save.level or 1,
 		abilities = s.save.abilities or {},
 		echoes = s.save.echoes or {},
+		bossesDefeated = s.save.defeatedBosses or {},
+		roles = s.save.roles or {},
+		jobs = s.save.jobs or {},
+		pages = s.save.foundPages or {},
 		grandKey = s.save.grandKey or false,
 		machineAwake = s.save.machineAwake or false,
 		deaths = s.deaths or 0,

@@ -23,7 +23,8 @@
       "LootChests": { "$path": "src/ServerScriptService/LootChests.luau" },
       "AdminCommands": { "$path": "src/ServerScriptService/AdminCommands.luau" },
       "Tutorial": { "$path": "src/ServerScriptService/Tutorial.luau" },
-      "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" }
+      "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" },
+      "Pages": { "$path": "src/ServerScriptService/Pages.luau" }
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",
