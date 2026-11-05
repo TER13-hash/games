@@ -10,6 +10,14 @@ local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+-- SyncGui must exist BEFORE requiring the UI modules: TitleScreen/PauseMenu/Settings
+-- WaitForChild("SyncGui") at module scope, and would deadlock this script forever.
+local SyncGuiEarly = Instance.new("ScreenGui")
+SyncGuiEarly.Name = "SyncGui"
+SyncGuiEarly.ResetOnSpawn = false
+SyncGuiEarly.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+SyncGuiEarly.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+
 local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
 local Effects = require(script.Parent:WaitForChild("Effects"))
 local TitleScreen = require(script.Parent:WaitForChild("TitleScreen"))
@@ -111,11 +119,8 @@ end
 
 -- —————— HUD construction ——————
 
-gui = Instance.new("ScreenGui")
-gui.Name = "SyncGui"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = player:WaitForChild("PlayerGui")
+-- SyncGui was already created above (the UI modules required it early)
+gui = SyncGuiEarly
 
 frame = Instance.new("Frame")
 frame.Name = "Frame"
