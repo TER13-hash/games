@@ -14,6 +14,9 @@
         },
         "SoundIDs": {
           "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/SoundIDs.luau"
+        },
+        "ExampleCounter": {
+          "$path": "roblox-enchanted-realm/src/Examples/ExampleCounter.luau"
         }
       }
     },
@@ -36,6 +39,18 @@
       },
       "SaveData": {
         "$path": "roblox-enchanted-realm/src/ServerScriptService/SaveData.luau"
+      },
+      "LootChests": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/LootChests.luau"
+      },
+      "AdminCommands": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/AdminCommands.luau"
+      },
+      "Tutorial": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/Tutorial.luau"
+      },
+      "Merchant": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/Merchant.luau"
       }
     },
     "StarterPlayer": {

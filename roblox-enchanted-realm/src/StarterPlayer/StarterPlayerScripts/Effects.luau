@@ -139,6 +139,7 @@ function Effects.cast(abilityId: string, origin: Vector3, dir: Vector3)
 		wind = Color3.fromRGB(180, 255, 210),
 		powerRock = Color3.fromRGB(170, 150, 120),
 		lightningCore = Color3.fromRGB(255, 255, 220),
+		shockwave = Color3.fromRGB(150, 215, 255),
 	}[abilityId] or Color3.fromRGB(255, 255, 255)
 	burst(origin + dir * 2 + Vector3.new(0, 1, 0), color, 22, 1.1)
 	-- trail forward

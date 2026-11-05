@@ -30,6 +30,7 @@ Config.INK = {
 		wind = 20,
 		powerRock = 35, -- a heavy slam, always worth it
 		lightningCore = 45,
+		shockwave = 40,
 	},
 }
 
@@ -79,6 +80,7 @@ Config.ABILITIES = {
 	ice        = { id = "ice",        name = "Ice",         icon = "❄", color = Color3.fromRGB(150, 225, 255), desc = "Freezes waterfalls and creates ice platforms." },
 	wind       = { id = "wind",       name = "Wind",        icon = "🍃", color = Color3.fromRGB(170, 255, 190), desc = "Huge jumps, wind glide and air dash currents." },
 	lightningCore = { id = "lightningCore", name = "Lightning Core", icon = "✦", color = Color3.fromRGB(255, 255, 200), desc = "Enhanced lightning. Wakes the gigantic machine underground." },
+	shockwave   = { id = "shockwave",   name = "Shockwave",    icon = "◎", color = Color3.fromRGB(150, 215, 255), desc = "A ring of raw ink energy — damages and hurls back everything around you." },
 }
 
 -- Barriers that only open with a specific power

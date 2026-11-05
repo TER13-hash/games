@@ -8,7 +8,8 @@
         "$className": "Folder",
         "Config": { "$path": "src/ReplicatedStorage/Modules/Config.luau" },
         "Regions": { "$path": "src/ReplicatedStorage/Modules/Regions.luau" },
-        "SoundIDs": { "$path": "src/ReplicatedStorage/Modules/SoundIDs.luau" }
+        "SoundIDs": { "$path": "src/ReplicatedStorage/Modules/SoundIDs.luau" },
+        "ExampleCounter": { "$path": "src/Examples/ExampleCounter.luau" }
       }
     },
     "ServerScriptService": {
@@ -18,7 +19,11 @@
       "WorldBuilder": { "$path": "src/ServerScriptService/WorldBuilder.luau" },
       "Enemies": { "$path": "src/ServerScriptService/Enemies.luau" },
       "Bosses": { "$path": "src/ServerScriptService/Bosses.luau" },
-      "SaveData": { "$path": "src/ServerScriptService/SaveData.luau" }
+      "SaveData": { "$path": "src/ServerScriptService/SaveData.luau" },
+      "LootChests": { "$path": "src/ServerScriptService/LootChests.luau" },
+      "AdminCommands": { "$path": "src/ServerScriptService/AdminCommands.luau" },
+      "Tutorial": { "$path": "src/ServerScriptService/Tutorial.luau" },
+      "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" }
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",

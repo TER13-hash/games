@@ -13,6 +13,10 @@ local Bosses = require(script.Parent:WaitForChild("Bosses"))
 local Enemies = require(script.Parent:WaitForChild("Enemies"))
 local Session = require(script.Parent:WaitForChild("Session"))
 local SaveData = require(script.Parent:WaitForChild("SaveData"))
+local LootChests = require(script.Parent:WaitForChild("LootChests"))
+local AdminCommands = require(script.Parent:WaitForChild("AdminCommands"))
+local Tutorial = require(script.Parent:WaitForChild("Tutorial"))
+local Merchant = require(script.Parent:WaitForChild("Merchant"))
 
 -- ————————————————————— remotes ——————————————————————
 local remotes = Instance.new("Folder")
@@ -272,6 +276,7 @@ Players.PlayerAdded:Connect(function(player)
 	end)
 	player:LoadCharacter()
 	pushSync(s)
+	Tutorial.onPlayer(RE, player)
 	RE.dialogue:FireClient(player, "mish_intro", "Mish: You're awake... you're in Encantadia now. The only way home is the Grand Key — held by Nukos, deep below.")
 	RE.narrator:FireClient(player, "Enchanted Realm: Inkbound", 4)
 end)
@@ -403,6 +408,7 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		or abilityId == "ice" and "IceCast"
 		or abilityId == "wind" and "WindCast"
 		or abilityId == "powerRock" and "RockShatter"
+		or abilityId == "shockwave" and "RockShatter"
 		or "LightningCast", origin, 0.8)
 	RE.vfx:FireAllClients("cast", abilityId, origin, dir)
 
@@ -442,7 +448,7 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 				local to = c.body.Position - origin
 				local flat = Vector3.new(to.X, 0, to.Z)
 				if flat.Magnitude > 0 and flat:Dot(coneDir) > 0.5 * flat.Magnitude then
-					Enemies.damage(c, Session.baseDamage(s), "fire", origin)
+					Enemies.damage(c, Session.baseDamage(s), origin, "fire")
 				end
 			end
 		end)
@@ -502,7 +508,7 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		Bosses.damageInRange(origin, 14, Session.baseDamage(s) * 2, "rock")
 		Enemies.forEach(function(c)
 			if (c.body.Position - origin).Magnitude < 14 then
-				Enemies.damage(c, Session.baseDamage(s) * 2, "rock", origin)
+				Enemies.damage(c, Session.baseDamage(s) * 2, origin, "rock")
 			end
 		end)
 		for _, b in ipairs(world.barriers) do
@@ -523,6 +529,19 @@ RE.cast.OnServerEvent:Connect(function(player, abilityId: string, aimX: number, 
 		emitter.Parent = a
 		emitter:Emit(40)
 		Debris:AddItem(a, 1)
+
+	elseif abilityId == "shockwave" then
+		-- nova: damage every enemy/boss around you, small hop for flavor
+		local radius = 16
+		local dmg = Session.baseDamage(s) * 1.5
+		Enemies.forEach(function(c)
+			if (c.body.Position - origin).Magnitude < radius then
+				Enemies.damage(c, dmg, origin, "physical")
+			end
+		end)
+		Bosses.damageInRange(origin, radius, dmg, "physical")
+		hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 26, 0)
+		RE.vfx:FireAllClients("bossBurst", origin, Color3.fromRGB(150, 215, 255))
 	end
 end)
 
@@ -543,7 +562,7 @@ RE.swing.OnServerEvent:Connect(function(player, dirX: number)
 		local to = c.body.Position - origin
 		local flat = Vector3.new(to.X, 0, to.Z)
 		if flat.Magnitude < Config.PLAYER.attackRange and flat:Dot(dir) > 0.4 then
-			Enemies.damage(c, Session.baseDamage(s), "physical", origin)
+			Enemies.damage(c, Session.baseDamage(s), origin, "physical")
 			hitAny = true
 		end
 	end)
@@ -733,6 +752,10 @@ task.spawn(function()
 		end
 	end
 end)
+
+LootChests.init(RE)
+AdminCommands.init(RE)
+Merchant.init(RE)
 
 Enemies.setCallbacks(RE, hurtPlayer)
 Enemies.spawnAllFromRegions()

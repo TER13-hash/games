@@ -72,8 +72,8 @@ local abilityBar: Frame
 local abilityBtns: { [string]: TextButton } = {}
 local cooldownOverlays: { [string]: Frame } = {}
 
-local ABILITY_ORDER = { "lightning", "fire", "ice", "wind", "powerRock", "lightningCore" }
-local hotkeys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five, Enum.KeyCode.Six }
+local ABILITY_ORDER = { "lightning", "fire", "ice", "wind", "powerRock", "lightningCore", "shockwave" }
+local hotkeys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five, Enum.KeyCode.Six, Enum.KeyCode.Seven }
 
 -- —————— helpers ——————
 
@@ -230,8 +230,8 @@ local abilityBtnSize = if isMobile then 56 else 48
 abilityBar = Instance.new("Frame")
 abilityBar.Name = "AbilityBar"
 abilityBar.BackgroundTransparency = 1
-abilityBar.Size = UDim2.new(0, abilityBtnSize * 6 + 30, 0, abilityBtnSize + 10)
-abilityBar.Position = UDim2.new(0.5, -(abilityBtnSize * 6 + 30) / 2, 0, if isMobile then 176 else 156)
+abilityBar.Size = UDim2.new(0, abilityBtnSize * 7 + 36, 0, abilityBtnSize + 10)
+abilityBar.Position = UDim2.new(0.5, -(abilityBtnSize * 7 + 36) / 2, 0, if isMobile then 176 else 156)
 abilityBar.Parent = frame
 
 -- ability tooltip
