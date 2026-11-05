@@ -995,7 +995,7 @@ local function tick(dt: number)
 					if not (boss :: any).stillSince then
 						(boss :: any).stillSince = now
 					elseif now - (boss :: any).stillSince > 1.6 and ready(boss, "eruption", now) then
-						pickCooldown(boss, "eruption", now, 3.5)
+						pickCooldown(boss, "eruption", now, 3.5);
 						(boss :: any).stillSince = now -- reset timer
 						telegraphedStrike(hrp.Position.X, 0.9, 2.6, 25, Color3.fromRGB(255, 110, 30), "Fire Eruption")
 					end

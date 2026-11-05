@@ -134,7 +134,7 @@ function Effects.swing(origin: Vector3, dir: Vector3, hit: boolean)
 end
 
 function Effects.cast(abilityId: string, origin: Vector3, dir: Vector3)
-	local color = {
+	local color = ({
 		lightning = Color3.fromRGB(140, 225, 255),
 		fire = Color3.fromRGB(255, 130, 40),
 		ice = Color3.fromRGB(160, 230, 255),
@@ -142,7 +142,7 @@ function Effects.cast(abilityId: string, origin: Vector3, dir: Vector3)
 		powerRock = Color3.fromRGB(170, 150, 120),
 		lightningCore = Color3.fromRGB(255, 255, 220),
 		shockwave = Color3.fromRGB(150, 215, 255),
-	}[abilityId] or Color3.fromRGB(255, 255, 255)
+	})[abilityId] or Color3.fromRGB(255, 255, 255)
 	burst(origin + dir * 2 + Vector3.new(0, 1, 0), color, 22, 1.1)
 	-- trail forward
 	local trail = Instance.new("Part")
@@ -161,7 +161,7 @@ function Effects.cast(abilityId: string, origin: Vector3, dir: Vector3)
 end
 
 function Effects.breakBarrier(position: Vector3, btype: string)
-	local color = {
+	local color = ({
 		electric = Color3.fromRGB(140, 225, 255),
 		stone = Color3.fromRGB(170, 150, 120),
 		frozen = Color3.fromRGB(160, 230, 255),
@@ -170,7 +170,7 @@ function Effects.breakBarrier(position: Vector3, btype: string)
 		wood = Color3.fromRGB(150, 110, 70),
 		rock = Color3.fromRGB(170, 150, 120),
 		machineSeal = Color3.fromRGB(200, 140, 255),
-	}[btype] or Color3.fromRGB(255, 255, 255)
+	})[btype] or Color3.fromRGB(255, 255, 255)
 	burst(position, color, 34, 1.2)
 	Effects.shakeCamera(0.12, 0.2)
 end

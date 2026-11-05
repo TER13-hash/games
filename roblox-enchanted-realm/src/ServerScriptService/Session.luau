@@ -34,12 +34,12 @@ end
 
 function Session.fresh(player: Player): State
 	local save = SaveData.load(player.UserId)
-	save.level = save.level or 1
+	save.level = save.level or 1 -- safety: never nil
 	local s: State = {
 		player = player,
 		save = save,
 		dirty = false,
-		hp = 0,
+		hp = 0, -- set below
 		ink = Config.INK.startInk,
 		invulnerableUntil = 0,
 		hazardCooldowns = {},
@@ -50,6 +50,8 @@ function Session.fresh(player: Player): State
 		rootUntil = 0,
 		awakenUntil = 0,
 		lastCheckpointId = save.checkpointId or "cp_start",
+		-- FIX: restore the saved Y too (was always 2, which dropped sky-island
+		-- checkpoints into the pit on rejoin)
 		checkpointPos = Vector3.new(save.checkpointX or 30, save.checkpointY or 2, 0),
 		deaths = save.deaths or 0,
 	}
@@ -62,6 +64,7 @@ function Session.get(player: Player): State?
 	return sessions[player.UserId]
 end
 
+-- FIX: sessions were never removed, leaking memory and leaving stale entries
 function Session.remove(player: Player)
 	sessions[player.UserId] = nil
 end
@@ -136,7 +139,7 @@ function Session.maxInk(s: State): number
 	return Config.INK.max + (s.save.maxInkBonus or 0) + 20 * Session.jobRank(s, "mage")
 end
 
-function Session.addXp(s: State, amount: number): boolean
+function Session.addXp(s: State, amount: number): boolean -- returns true if leveled up
 	local leveled = false
 	local rank = Session.jobRank(s, "healer")
 	if rank > 0 then
@@ -170,7 +173,7 @@ end
 function Session.setCheckpoint(s: State, checkpointId: string, pos: Vector3)
 	s.save.checkpointId = checkpointId
 	s.save.checkpointX = pos.X
-	s.save.checkpointY = pos.Y
+	s.save.checkpointY = pos.Y -- FIX: persist Y as well
 	s.lastCheckpointId = checkpointId
 	s.checkpointPos = pos
 	s.dirty = true
@@ -180,8 +183,10 @@ function Session.flush(s: State)
 	if not s.dirty then
 		return
 	end
+	-- FIX: clear the flag BEFORE the (yielding) save so changes made while
+	-- saving are not lost; restore it if the save fails.
 	s.dirty = false
-	s.save.deaths = s.deaths
+	s.save.deaths = s.deaths -- FIX: deaths were never written to the save
 	local ok, result = pcall(SaveData.save, s.player.UserId, s.save)
 	if not ok or result == false then
 		warn("[Session] save failed for", s.player.Name, ok and "" or result)
@@ -199,6 +204,7 @@ function Session.wipeAndReset(s: State)
 	local player = s.player
 	s.save = SaveData.wipe(player.UserId)
 	local fresh = Session.fresh(player)
+	-- keep same identity, but fresh() overwrote the sessions table entry; copy fields over
 	for k, v in pairs(fresh) do
 		(s :: any)[k] = v
 	end
@@ -229,6 +235,7 @@ function Session.syncPayload(s: State)
 	}
 end
 
+-- damage with Piyedro's Stone Skin applied
 function Session.applyDamage(s: State, raw: number)
 	if Session.hasEcho(s, "piyedroEcho") then
 		raw *= 0.8

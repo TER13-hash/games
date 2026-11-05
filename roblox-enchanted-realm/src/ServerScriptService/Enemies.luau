@@ -374,7 +374,7 @@ local function tick(dt: number)
 					onPlayerDamaged(def.damage, body.Position, def.name)
 				end
 			end
-		elsif def.ranged then
+		elseif def.ranged then
 			-- cinderfrog: keep mid distance, spit fireballs
 			local wantDist = 11
 			local move3 = Vector3.zero

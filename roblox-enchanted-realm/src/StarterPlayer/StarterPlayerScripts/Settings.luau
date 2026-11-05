@@ -38,7 +38,7 @@ title.TextScaled = true
 title.ZIndex = 121
 title.Parent = panel
 
-local function sliderRow(labelText: string, y: number, onChanged: (value: number) -> (), initial: number): { Frame, Frame, TextLabel }
+local function sliderRow(labelText: string, y: number, onChanged: (value: number) -> (), initial: number): (Frame, Frame, TextLabel)
 	local row = Instance.new("Frame")
 	row.BackgroundTransparency = 1
 	row.Size = UDim2.new(1, -40, 0, 40)

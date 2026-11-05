@@ -185,7 +185,7 @@ objectiveLabel.TextXAlignment = Enum.TextXAlignment.Left
 objectiveLabel.Parent = topBar
 
 -- stat rows
-local function makeStatRow(name: string, labelText: string, barColor: Color3, order: number): { Frame, Frame, TextLabel }
+local function makeStatRow(name: string, labelText: string, barColor: Color3, order: number): (Frame, Frame, Frame, TextLabel)
 	local row = Instance.new("Frame")
 	row.Name = name
 	row.BackgroundTransparency = 1

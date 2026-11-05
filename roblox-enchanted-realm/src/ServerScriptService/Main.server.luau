@@ -209,14 +209,14 @@ end, function(kind)
 	local bossDef = Config.BOSSES[kind]
 	Session.addXp(s, bossDef.xp)
 	Session.markBossDefeated(s, kind)
-	local reward = {
+	local reward = ({
 		mechanical = { abl = "lightning", echo = "kidlatEcho" },
 		machine = { abl = "powerRock", echo = "piyedroEcho" },
 		fire = { abl = "fire", echo = "peyroEcho" },
 		ice = { abl = "ice", echo = "danEcho" },
 		storm = { abl = "wind", echo = "jyrEcho" },
 		squid = { abl = "lightningCore", echo = "nukosEcho" },
-	}[kind]
+	})[kind]
 	if reward then
 		Session.grantAbility(s, reward.abl)
 		Session.grantEcho(s, reward.echo)
@@ -1009,7 +1009,7 @@ task.spawn(function()
 		if r.id ~= lastRegionId then
 			lastRegionId = r.id
 			RE.ZoneEnter:FireClient(p, r.id, r.name)
-			local zoneObj = {
+			local zoneObj = ({
 				forest = Config.OBJECTIVES.start,
 				ruins = Config.OBJECTIVES.openElectric,
 				burning = Config.OBJECTIVES.burning,
@@ -1017,7 +1017,7 @@ task.spawn(function()
 				cave = Config.OBJECTIVES.openWaterfall,
 				sky = Config.OBJECTIVES.stormBoss,
 				underground = Config.OBJECTIVES.underground,
-			}[r.id]
+			})[r.id]
 			if zoneObj then
 				objectiveText.Value = zoneObj
 			end
