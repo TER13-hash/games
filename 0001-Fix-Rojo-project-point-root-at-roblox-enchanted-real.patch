@@ -1,0 +1,229 @@
+From 45a8d3008aee7e52150c12c2667862e30412d51f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 20:07:53 +0000
+Subject: [PATCH] Fix Rojo project: point root at roblox-enchanted-realm, fix
+ module requires, rename client modules
+
+---
+ default.project.json                          | 109 ++++++++++--------
+ roblox-enchanted-realm/default.project.json   |   6 +-
+ .../src/ServerScriptService/Main.server.luau  |  10 +-
+ .../GameClient.client.luau                    |   8 +-
+ .../{PauseMenu.client.luau => PauseMenu.luau} |   0
+ .../{Settings.client.luau => Settings.luau}   |   0
+ ...tleScreen.client.luau => TitleScreen.luau} |   0
+ 7 files changed, 75 insertions(+), 58 deletions(-)
+ rename roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/{PauseMenu.client.luau => PauseMenu.luau} (100%)
+ rename roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/{Settings.client.luau => Settings.luau} (100%)
+ rename roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/{TitleScreen.client.luau => TitleScreen.luau} (100%)
+
+diff --git a/default.project.json b/default.project.json
+index 7bc8ee5b..df74c274 100644
+--- a/default.project.json
++++ b/default.project.json
+@@ -2,70 +2,87 @@
+   "name": "games",
+   "tree": {
+     "$className": "DataModel",
+-
+     "ReplicatedStorage": {
+-      "Shared": {
+-        "$path": "src/shared"
++      "$className": "ReplicatedStorage",
++      "Modules": {
++        "$className": "Folder",
++        "Config": {
++          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/Config.luau"
++        },
++        "Regions": {
++          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/Regions.luau"
++        },
++        "SoundIDs": {
++          "$path": "roblox-enchanted-realm/src/ReplicatedStorage/Modules/SoundIDs.luau"
++        }
+       }
+     },
+-
+     "ServerScriptService": {
+-      "Server": {
+-        "$path": "src/server"
++      "$className": "ServerScriptService",
++      "Main": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/Main.server.luau"
++      },
++      "Session": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/Session.luau"
++      },
++      "WorldBuilder": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/WorldBuilder.luau"
++      },
++      "Enemies": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/Enemies.luau"
++      },
++      "Bosses": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/Bosses.luau"
++      },
++      "SaveData": {
++        "$path": "roblox-enchanted-realm/src/ServerScriptService/SaveData.luau"
+       }
+     },
+-
+     "StarterPlayer": {
++      "$className": "StarterPlayer",
+       "StarterPlayerScripts": {
+-        "Client": {
+-          "$path": "src/client"
+-        }
+-      }
+-    },
+-
+-    "Workspace": {
+-      "$properties": {
+-        "FilteringEnabled": true
+-      },
+-      "Baseplate": {
+-        "$className": "Part",
+-        "$properties": {
+-          "Anchored": true,
+-          "Color": [
+-            0.38823,
+-            0.37254,
+-            0.38823
+-          ],
+-          "Locked": true,
+-          "Position": [
+-            0,
+-            -10,
+-            0
+-          ],
+-          "Size": [
+-            512,
+-            20,
+-            512
+-          ]
++        "$className": "StarterPlayerScripts",
++        "GameClient": {
++          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau"
++        },
++        "Effects": {
++          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Effects.luau"
++        },
++        "TitleScreen": {
++          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau"
++        },
++        "PauseMenu": {
++          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau"
++        },
++        "Settings": {
++          "$path": "roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.luau"
+         }
+       }
+     },
+     "Lighting": {
++      "$className": "Lighting",
+       "$properties": {
++        "ClockTime": 14.5,
++        "Brightness": 2.2,
+         "Ambient": [
+-          0,
+-          0,
+-          0
++          0.18,
++          0.22,
++          0.2
++        ],
++        "OutdoorAmbient": [
++          0.25,
++          0.3,
++          0.28
+         ],
+-        "Brightness": 2,
+-        "GlobalShadows": true,
+-        "Outlines": false,
+-        "Technology": "Voxel"
++        "FogEnd": 1200,
++        "Technology": "Future"
+       }
+     },
+-    "SoundService": {
++    "Workspace": {
++      "$className": "Workspace",
+       "$properties": {
+-        "RespectFilteringEnabled": true
++        "Gravity": 150,
++        "StreamingEnabled": false
+       }
+     }
+   }
+diff --git a/roblox-enchanted-realm/default.project.json b/roblox-enchanted-realm/default.project.json
+index 6d5cbaa7..01dca9d0 100644
+--- a/roblox-enchanted-realm/default.project.json
++++ b/roblox-enchanted-realm/default.project.json
+@@ -26,9 +26,9 @@
+         "$className": "StarterPlayerScripts",
+         "GameClient": { "$path": "src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau" },
+         "Effects": { "$path": "src/StarterPlayer/StarterPlayerScripts/Effects.luau" },
+-        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.client.luau" },
+-        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.client.luau" },
+-        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.client.luau" }
++        "TitleScreen": { "$path": "src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau" },
++        "PauseMenu": { "$path": "src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau" },
++        "Settings": { "$path": "src/StarterPlayer/StarterPlayerScripts/Settings.luau" }
+       }
+     },
+     "Lighting": {
+diff --git a/roblox-enchanted-realm/src/ServerScriptService/Main.server.luau b/roblox-enchanted-realm/src/ServerScriptService/Main.server.luau
+index 8b0fde5e..43ba06e8 100644
+--- a/roblox-enchanted-realm/src/ServerScriptService/Main.server.luau
++++ b/roblox-enchanted-realm/src/ServerScriptService/Main.server.luau
+@@ -8,11 +8,11 @@ local Debris = game:GetService("Debris")
+ local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+ local Regions = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Regions"))
+ local SoundIDs = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SoundIDs"))
+-local WorldBuilder = require(script:WaitForChild("WorldBuilder"))
+-local Bosses = require(script:WaitForChild("Bosses"))
+-local Enemies = require(script:WaitForChild("Enemies"))
+-local Session = require(script:WaitForChild("Session"))
+-local SaveData = require(script:WaitForChild("SaveData"))
++local WorldBuilder = require(script.Parent:WaitForChild("WorldBuilder"))
++local Bosses = require(script.Parent:WaitForChild("Bosses"))
++local Enemies = require(script.Parent:WaitForChild("Enemies"))
++local Session = require(script.Parent:WaitForChild("Session"))
++local SaveData = require(script.Parent:WaitForChild("SaveData"))
+ 
+ -- ————————————————————— remotes ——————————————————————
+ local remotes = Instance.new("Folder")
+diff --git a/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau b/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau
+index 9c3a4463..3ebd567d 100644
+--- a/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau
++++ b/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/GameClient.client.luau
+@@ -11,10 +11,10 @@ local Debris = game:GetService("Debris")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+ 
+ local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+-local Effects = require(script:WaitForChild("Effects"))
+-local TitleScreen = require(script:WaitForChild("TitleScreen.client.luau"))
+-local PauseMenu = require(script:WaitForChild("PauseMenu.client.luau"))
+-local Settings = require(script:WaitForChild("Settings.client.luau"))
++local Effects = require(script.Parent:WaitForChild("Effects"))
++local TitleScreen = require(script.Parent:WaitForChild("TitleScreen"))
++local PauseMenu = require(script.Parent:WaitForChild("PauseMenu"))
++local Settings = require(script.Parent:WaitForChild("Settings"))
+ 
+ -- device detection
+ local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+diff --git a/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.client.luau b/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau
+similarity index 100%
+rename from roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.client.luau
+rename to roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/PauseMenu.luau
+diff --git a/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.client.luau b/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.luau
+similarity index 100%
+rename from roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.client.luau
+rename to roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/Settings.luau
+diff --git a/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.client.luau b/roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau
+similarity index 100%
+rename from roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.client.luau
+rename to roblox-enchanted-realm/src/StarterPlayer/StarterPlayerScripts/TitleScreen.luau
+-- 
+2.43.0
+
