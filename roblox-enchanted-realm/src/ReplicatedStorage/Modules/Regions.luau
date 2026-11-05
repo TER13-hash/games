@@ -22,13 +22,13 @@ Regions.byId = {
 		name = "Enchanted Forest",
 		minX = 0, maxX = 400,
 		env = { fog = Color3.fromRGB(28, 52, 36), density = 0.55, ambient = Color3.fromRGB(70, 96, 74) },
-		grounds = { { x0 = 0, x1 = 145, topY = 0 }, { x0 = 157, x1 = 400, topY = 0 } }, -- 12-stud hollow log pit
+		grounds = { { x0 = 0, x1 = 145, topY = 0 }, { x0 = 157, x1 = 232, topY = 0 }, { x0 = 276, x1 = 400, topY = 0 } }, -- the forest river (x 232–276) splits the ground; the ferry crosses it
 		platforms = {
 			{ x = 56, y = 8, w = 12 },
 			{ x = 96, y = 13, w = 10 },
 			{ x = 140, y = 8, w = 12 },
 			{ x = 190, y = 9, w = 12 },
-			{ x = 236, y = 14, w = 10 },
+			{ x = 266, y = 14, w = 10 }, -- east side of the river (air bridge landings)
 			{ x = 280, y = 8, w = 12 },
 			{ x = 330, y = 9, w = 10 },
 		},
@@ -36,11 +36,11 @@ Regions.byId = {
 			{ kind = "creep", x = 72 },
 			{ kind = "creep", x = 104 },
 			{ kind = "creep", x = 150 },
-			{ kind = "creep", x = 215 },
-			{ kind = "creep", x = 252 },
+			{ kind = "creep", x = 185 },
+			{ kind = "creep", x = 268 },
 			{ kind = "creep", x = 290 },
 		},
-		boss = { kind = "mechanical", x = 345, arenaMinX = 250, arenaMaxX = 380 },
+		boss = { kind = "mechanical", x = 345, arenaMinX = 264, arenaMaxX = 380 },
 		vinePatch = { x0 = 300, x1 = 330 }, -- bait the Mechanical Guardian onto this to root it
 		hearts = { { x = 88, y = 5, sealedBy = "vine" } }, -- hidden Heart Container, burn the vines
 		barrierBlocks = { { type = "vine", x = 88, y = 5, w = 8, h = 10, d = 8 } },

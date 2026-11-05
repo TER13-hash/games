@@ -54,6 +54,9 @@
       },
       "Pages": {
         "$path": "roblox-enchanted-realm/src/ServerScriptService/Pages.luau"
+      },
+      "Ferry": {
+        "$path": "roblox-enchanted-realm/src/ServerScriptService/Ferry.luau"
       }
     },
     "StarterPlayer": {

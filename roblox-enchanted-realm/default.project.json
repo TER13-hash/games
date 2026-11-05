@@ -24,7 +24,8 @@
       "AdminCommands": { "$path": "src/ServerScriptService/AdminCommands.luau" },
       "Tutorial": { "$path": "src/ServerScriptService/Tutorial.luau" },
       "Merchant": { "$path": "src/ServerScriptService/Merchant.luau" },
-      "Pages": { "$path": "src/ServerScriptService/Pages.luau" }
+      "Pages": { "$path": "src/ServerScriptService/Pages.luau" },
+      "Ferry": { "$path": "src/ServerScriptService/Ferry.luau" }
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",

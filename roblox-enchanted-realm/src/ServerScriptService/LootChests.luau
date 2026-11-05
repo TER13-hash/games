@@ -18,7 +18,7 @@ type ChestSpec = { x: number, ink: number?, xp: number? }
 local CHESTS: { ChestSpec } = {
 	{ x = 60,   ink = 25 },
 	{ x = 145,  xp = 60  },
-	{ x = 230,  ink = 35 },
+	{ x = 278,  ink = 35 },
 	{ x = 350,  xp = 75  },
 	{ x = 500,  ink = 40 },
 	{ x = 700,  xp = 110 },

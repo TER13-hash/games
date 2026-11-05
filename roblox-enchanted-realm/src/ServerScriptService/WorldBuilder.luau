@@ -628,6 +628,21 @@ function WorldBuilder.build(rootName: string)
 		end
 	end
 
+	-- the forest river: drowning hazard filling the gap (x 232..276)
+	local drown = newPart({
+		name = "ForestRiver_Drowning",
+		size = Vector3.new(44, 8, 46),
+		cframe = CFrame.new(254, -3.5, 0),
+		color = Color3.fromRGB(20, 60, 110),
+		transparency = 1,
+		parent = hazardsFolder,
+		canCollide = false,
+	})
+	drown:SetAttribute("Hazard", "water")
+	drown:SetAttribute("Damage", 9999)
+	drown.CanTouch = true
+	table.insert(built.hazards, drown)
+
 	-- checkpoint lanterns (from Config)
 	for _, cp in ipairs(Config.CHECKPOINTS) do
 		local baseY = 0

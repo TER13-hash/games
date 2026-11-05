@@ -18,6 +18,7 @@ local AdminCommands = require(script.Parent:WaitForChild("AdminCommands"))
 local Tutorial = require(script.Parent:WaitForChild("Tutorial"))
 local Merchant = require(script.Parent:WaitForChild("Merchant"))
 local Pages = require(script.Parent:WaitForChild("Pages"))
+local Ferry = require(script.Parent:WaitForChild("Ferry"))
 
 -- ————————————————————— remotes ——————————————————————
 local remotes = Instance.new("Folder")
@@ -979,6 +980,7 @@ LootChests.init(RE)
 AdminCommands.init(RE)
 Merchant.init(RE)
 Pages.init(RE)
+Ferry.init()
 
 Enemies.setCallbacks(RE, hurtPlayer)
 Enemies.spawnAllFromRegions()
